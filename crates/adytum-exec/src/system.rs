@@ -41,7 +41,7 @@ impl SystemRunner {
 
 /// Finds the program: a name with a path separator is used as given, a bare
 /// name is searched for in `PATH` (the command's, else this process's).
-fn resolve(cmd: &Command) -> Result<PathBuf, ExecError> {
+pub(crate) fn resolve(cmd: &Command) -> Result<PathBuf, ExecError> {
     let program = cmd.program();
     if program.is_empty() {
         return Err(ExecError::EmptyProgram);
@@ -106,7 +106,7 @@ fn spawn(cmd: &Command, stdin: Stdio, stderr_piped: bool) -> Result<Spawned, Exe
 }
 
 #[cfg(unix)]
-fn signal_group(pgid: u32, kill: bool) {
+pub(crate) fn signal_group(pgid: u32, kill: bool) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     let Ok(raw) = i32::try_from(pgid) else { return };

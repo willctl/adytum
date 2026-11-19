@@ -10,6 +10,7 @@ use std::time::Duration;
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
+    raw_args: Vec<OsString>,
     env: BTreeMap<OsString, OsString>,
     cwd: Option<PathBuf>,
     deadline: Option<Duration>,
@@ -19,7 +20,7 @@ pub struct Command {
 impl Command {
     #[must_use]
     pub fn new(program: impl AsRef<OsStr>) -> Command {
-        Command { program: program.as_ref().to_owned(), args: Vec::new(), env: BTreeMap::new(), cwd: None, deadline: None, stdin: None }
+        Command { program: program.as_ref().to_owned(), args: Vec::new(), raw_args: Vec::new(), env: BTreeMap::new(), cwd: None, deadline: None, stdin: None }
     }
 
     #[must_use]
@@ -35,6 +36,16 @@ impl Command {
         S: AsRef<OsStr>,
     {
         self.args.extend(args.into_iter().map(|a| a.as_ref().to_owned()));
+        self
+    }
+
+    /// Windows only: an argument passed to the child exactly as written,
+    /// with no quoting (for a command line a program parses itself). It
+    /// still never reaches a shell.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn raw_arg(mut self, arg: impl AsRef<OsStr>) -> Command {
+        self.raw_args.push(arg.as_ref().to_owned());
         self
     }
 
@@ -86,6 +97,11 @@ impl Command {
         &self.args
     }
 
+    #[cfg(windows)]
+    pub(crate) fn raw_arg_list(&self) -> &[OsString] {
+        &self.raw_args
+    }
+
     pub fn env_vars(&self) -> &BTreeMap<OsString, OsString> {
         &self.env
     }
@@ -115,6 +131,7 @@ impl fmt::Debug for Command {
         f.debug_struct("Command")
             .field("program", &self.program)
             .field("args", &self.args)
+            .field("raw_args", &self.raw_args)
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("cwd", &self.cwd)
             .field("deadline", &self.deadline)

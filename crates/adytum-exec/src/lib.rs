@@ -13,15 +13,21 @@
 //! On unix each child leads its own process group, and a deadline or a
 //! cancel stops the whole group: SIGTERM, a short grace, then SIGKILL. On
 //! Windows only the child itself is stopped; its own children are not.
+//!
+//! [`Spawned`] starts a child under the same rules and hands it to the
+//! caller instead of waiting: its pid, its pipes, a live stderr tail, a
+//! non-blocking exit check and a group kill.
 
 mod command;
 mod duplex;
 mod error;
+mod spawned;
 mod system;
 
 pub use command::Command;
 pub use duplex::{Duplex, DuplexControl};
 pub use error::ExecError;
+pub use spawned::{Exit, Spawned, StderrTail};
 pub use system::SystemRunner;
 
 use async_trait::async_trait;
