@@ -99,7 +99,10 @@ fn spawn(cmd: &Command, stdin: Stdio, stderr_piped: bool) -> Result<Spawned, Exe
     #[cfg(unix)]
     c.process_group(0);
     #[cfg(windows)]
-    c.as_std_mut().creation_flags(0x0800_0000);
+    {
+        use std::os::windows::process::CommandExt as _;
+        c.as_std_mut().creation_flags(0x0800_0000);
+    }
     let child = c.spawn().map_err(|source| ExecError::Spawn { program: cmd.program().to_owned(), source })?;
     let pgid = if cfg!(unix) { child.id() } else { None };
     Ok(Spawned { child, pgid })
@@ -115,7 +118,7 @@ pub(crate) fn signal_group(pgid: u32, kill: bool) {
 }
 
 #[cfg(not(unix))]
-fn signal_group(_pgid: u32, _kill: bool) {}
+pub(crate) fn signal_group(_pgid: u32, _kill: bool) {}
 
 /// Stops the child and everything in its group: SIGTERM, a grace, SIGKILL.
 /// On Windows only the child itself is killed.

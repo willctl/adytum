@@ -170,6 +170,14 @@ impl Spawned {
         }
     }
 
+    /// Windows only: the child itself, for a caller that puts it in a job
+    /// object of its own (adytum-exec has no process group there, and
+    /// stays free of `unsafe`).
+    #[cfg(windows)]
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
     /// Kills the child and everything in its process group now (on
     /// Windows only the child), then reaps the child.
     pub fn kill_group(&mut self) {
