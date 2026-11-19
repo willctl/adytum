@@ -14,10 +14,13 @@
 //!   `stop` therefore list first and refuse a missing cell.
 //! - `limactl shell <name> -- <argv>` passes each argument to the guest
 //!   literally, so no quoting is done here; a live test pins that.
+//! - `limactl network create` writes into `$LIMA_HOME/_config/networks.yaml`
+//!   and does not stop two networks sharing a gateway; see [`network`].
 //! - Lima forwards every port a guest listens on, unless an `ignore` rule
 //!   matches it. The template (see [`template`]) ends with those rules.
 
 mod guest;
+pub mod network;
 mod pins;
 pub mod template;
 
@@ -105,6 +108,72 @@ impl Lima {
             return Err(DriverError::BadPath { path: self.home.display().to_string(), rule: "it is too long for the sockets Lima keeps inside it (about 100 bytes in all)" });
         }
         Ok(())
+    }
+
+    fn instance_file(&self, name: &CellName) -> PathBuf {
+        self.home.join(name.as_str()).join("lima.yaml")
+    }
+
+    /// The Adytum networks the instance `name` joins, read from its own
+    /// file. Nothing for an instance that is gone or has none.
+    fn networks_of(&self, name: &CellName) -> Vec<String> {
+        std::fs::read_to_string(self.instance_file(name)).map(|t| network::instance_networks(&t)).unwrap_or_default()
+    }
+
+    /// The networks Adytum made that Lima lists: `(name, gateway)`.
+    async fn lima_networks(&self) -> Result<Vec<(String, String)>, DriverError> {
+        let cmd = self.limactl().args(["network", "list"]).deadline(QUICK_DEADLINE);
+        let out = self.run(cmd, "limactl network list").await?;
+        if !out.success() {
+            return Err(DriverError::Tool { what: "limactl network list".to_owned(), status: out.status, stderr: tail(&out.stderr_lossy()) });
+        }
+        Ok(network::parse_network_list(&out.stdout_lossy()))
+    }
+
+    /// The gateway of the network the spec's cell joins, or `None` if the
+    /// spec names none or Lima has not made it yet.
+    pub async fn network_gateway(&self, spec: &CellSpec) -> Result<Option<String>, DriverError> {
+        self.check_home()?;
+        let Some(name) = template::network_for(spec) else { return Ok(None) };
+        Ok(self.lima_networks().await?.into_iter().find(|(n, _)| *n == name).map(|(_, gateway)| gateway))
+    }
+
+    /// Makes the network the spec names, if Lima does not have it yet.
+    async fn ensure_network(&self, spec: &CellSpec) -> Result<(), DriverError> {
+        let (Some(name), Some(network)) = (template::network_for(spec), spec.network.as_ref()) else { return Ok(()) };
+        let existing = self.lima_networks().await?;
+        if existing.iter().any(|(n, _)| *n == name) {
+            return Ok(());
+        }
+        // Lima does not refuse two networks with one gateway, so pick one nobody holds.
+        let gateway = (0..=u8::MAX)
+            .map(|shift| network::candidate_gateway(&spec.wall, network, shift))
+            .find(|g| !existing.iter().any(|(_, held)| held == g))
+            .ok_or_else(|| DriverError::Unsupported { what: "another network: every address Adytum may use is taken".to_owned() })?;
+        let cmd = self.limactl().args(["network", "create", "--tty=false"]).arg(&name).arg(format!("--gateway={gateway}/24")).deadline(QUICK_DEADLINE);
+        self.run_ok(cmd, "limactl network create", &spec.name).await.map(|_| ())
+    }
+
+    /// Deletes the given Adytum networks that no instance in this home joins
+    /// any more. Best effort: a network left behind is picked up the next time.
+    async fn prune_networks(&self, candidates: &[String]) {
+        if candidates.is_empty() {
+            return;
+        }
+        let mut in_use = std::collections::BTreeSet::new();
+        if let Ok(entries) = std::fs::read_dir(&self.home) {
+            for entry in entries.flatten() {
+                if let Ok(text) = std::fs::read_to_string(entry.path().join("lima.yaml")) {
+                    in_use.extend(network::instance_networks(&text));
+                }
+            }
+        }
+        let unused: Vec<&String> = candidates.iter().filter(|n| network::is_ours(n) && !in_use.contains(*n)).collect();
+        if unused.is_empty() {
+            return;
+        }
+        let cmd = self.limactl().args(["network", "delete", "--force", "--tty=false"]).args(unused).deadline(QUICK_DEADLINE);
+        let _ = self.run(cmd, "limactl network delete").await;
     }
 
     fn template_path(&self, name: &CellName) -> PathBuf {
@@ -216,11 +285,16 @@ impl Driver for Lima {
         let file = self.template_path(&spec.name);
         let dir = file.parent().unwrap_or(&self.home);
         std::fs::create_dir_all(dir).map_err(|source| DriverError::Io { what: "make the folder for templates", source })?;
+        self.ensure_network(spec).await?;
         std::fs::write(&file, text).map_err(|source| DriverError::Io { what: "write the template", source })?;
         let cmd = self.limactl().arg("create").arg(format!("--name={}", spec.name)).arg("--tty=false").arg(&file).deadline(CREATE_DEADLINE);
         let result = self.run_ok(cmd, "limactl create", &spec.name).await;
         // The template is only an input; the instance keeps its own copy.
         let _ = std::fs::remove_file(&file);
+        if result.is_err() {
+            // A network made for a cell that never came to be.
+            self.prune_networks(&template::network_for(spec).into_iter().collect::<Vec<_>>()).await;
+        }
         result.map(|_| ())
     }
 
@@ -303,9 +377,13 @@ impl Driver for Lima {
     async fn remove(&self, name: &CellName) -> Result<(), DriverError> {
         adytum_policy::name_is_ours(name.as_str())?;
         self.check_home()?;
+        // Read before the instance's folder goes.
+        let networks = self.networks_of(name);
         // Lima ignores a name that does not exist, so removing twice is fine.
         let cmd = self.limactl().args(["delete", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE);
-        self.run_ok(cmd, "limactl delete", name).await.map(|_| ())
+        self.run_ok(cmd, "limactl delete", name).await?;
+        self.prune_networks(&networks).await;
+        Ok(())
     }
 
     async fn clone(&self, from: &CellName, to: &CellSpec) -> Result<(), DriverError> {
@@ -313,7 +391,12 @@ impl Driver for Lima {
         adytum_policy::name_is_ours(to.name.as_str())?;
         self.check_home()?;
         self.check_socket_path(&to.name)?;
-        let edits = template::clone_edits(to)?;
+        let mut edits = template::clone_edits(to)?;
+        // The clone does not keep a network its spec does not name.
+        let source_networks = self.networks_of(from);
+        if to.network.is_none() && !source_networks.is_empty() {
+            edits.push(".networks = []".to_owned());
+        }
         let cells = self.list().await?;
         match cells.iter().find(|c| &c.name == from).map(|c| c.state) {
             None => return Err(DriverError::NotFound { name: from.to_string() }),
@@ -330,12 +413,17 @@ impl Driver for Lima {
             )
             .into());
         }
+        self.ensure_network(to).await?;
         let mut cmd = self.limactl().arg("clone").arg("--tty=false");
         for edit in &edits {
             cmd = cmd.arg("--set").arg(edit);
         }
         let cmd = cmd.arg(from.as_str()).arg(to.name.as_str()).deadline(CREATE_DEADLINE);
-        self.run_ok(cmd, "limactl clone", from).await.map(|_| ())
+        let result = self.run_ok(cmd, "limactl clone", from).await;
+        if result.is_err() {
+            self.prune_networks(&template::network_for(to).into_iter().collect::<Vec<_>>()).await;
+        }
+        result.map(|_| ())
     }
 
     async fn list(&self) -> Result<Vec<Listed>, DriverError> {

@@ -9,6 +9,8 @@
 use adytum_driver::DriverError;
 use adytum_model::{Arch, CellSpec, DriverKind};
 
+use crate::network::lima_network_name;
+
 /// The guest account's name. The host user's name is never copied in.
 const GUEST_USER: &str = "adytum";
 
@@ -33,7 +35,7 @@ fn unsupported(what: &str) -> DriverError {
 
 /// The template for `spec`. The same spec always gives the same text.
 ///
-/// Refuses what a Lima cell cannot honour (a clone, a network, secrets) and
+/// Refuses what a Lima cell cannot honour (a clone, secrets) and
 /// re-checks the rules that guard the host, so a driver called without the
 /// policy check first still cannot publish a port or mount a folder it should
 /// not.
@@ -47,9 +49,6 @@ pub fn render(spec: &CellSpec) -> Result<String, DriverError> {
     }
     if spec.clone_from.is_some() {
         return Err(unsupported("cloning a cell"));
-    }
-    if spec.network.is_some() {
-        return Err(unsupported("a named network"));
     }
     if !spec.secrets.is_empty() {
         return Err(unsupported("secrets"));
@@ -97,6 +96,11 @@ pub fn render(spec: &CellSpec) -> Result<String, DriverError> {
     line("  forwardAgent: false");
     line("  loadDotSSHPubKeys: false");
     line("propagateProxyEnv: false");
+    // No line at all without a network: that is Lima's own default.
+    if let Some(name) = network_for(spec) {
+        line("networks:");
+        line(&format!("- lima: {name}"));
+    }
     line("user:");
     line(&format!("  name: {GUEST_USER}"));
     line("  comment: \"\"");
@@ -134,9 +138,6 @@ pub fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, DriverError> {
     if spec.driver != DriverKind::Lima {
         return Err(unsupported("a cell for another driver"));
     }
-    if spec.network.is_some() {
-        return Err(unsupported("a named network"));
-    }
     if !spec.secrets.is_empty() {
         return Err(unsupported("secrets"));
     }
@@ -155,12 +156,23 @@ pub fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, DriverError> {
     for guest_ip in IGNORE_GUEST_IPS {
         forwards.push(serde_json::json!({ "guestIP": guest_ip, "proto": "any", "guestPortRange": [1, 65535], "ignore": true }));
     }
-    Ok(vec![
+    let mut edits = vec![
         format!(".cpus = {}", spec.resources.cpus),
         format!(".memory = \"{}MiB\"", spec.resources.memory_mib),
         format!(".mounts = {}", serde_json::Value::Array(mounts)),
         format!(".portForwards = {}", serde_json::Value::Array(forwards)),
-    ])
+    ];
+    if let Some(name) = network_for(spec) {
+        edits.push(format!(".networks = {}", serde_json::json!([{ "lima": name }])));
+    }
+    Ok(edits)
+}
+
+/// The Lima network the spec's cell joins, if it names one. It is made from
+/// the cell's own wall and the network's name, so a cell can only ever join
+/// a network of its own wall.
+pub fn network_for(spec: &CellSpec) -> Option<String> {
+    spec.network.as_ref().map(|n| lima_network_name(&spec.wall, n))
 }
 
 #[cfg(test)]
@@ -270,9 +282,6 @@ mod tests {
     #[test]
     fn what_lima_cannot_honour_is_refused_not_dropped() {
         let mut s = spec(true);
-        s.network = Some("net-1".parse().unwrap());
-        assert!(matches!(render(&s), Err(DriverError::Unsupported { .. })));
-        let mut s = spec(true);
         s.clone_from = Some("adytum-other".parse().unwrap());
         assert!(matches!(render(&s), Err(DriverError::Unsupported { .. })));
         let mut s = spec(true);
@@ -304,8 +313,68 @@ mod tests {
         s.ports.push(Port { guest: 80, host: 8080, bind: "0.0.0.0".parse().unwrap() });
         let Err(DriverError::Refused(r)) = clone_edits(&s) else { panic!("not refused") };
         assert_eq!(r.code, adytum_model::RefusalCode::PortNotLocalhost);
+    }
+
+    fn on_network(wall: &str, network: &str) -> CellSpec {
         let mut s = spec(true);
-        s.network = Some("net-1".parse().unwrap());
-        assert!(matches!(clone_edits(&s), Err(DriverError::Unsupported { .. })));
+        s.wall = wall.parse().unwrap();
+        s.network = Some(network.parse().unwrap());
+        s
+    }
+
+    #[test]
+    fn a_cell_with_no_network_gets_no_networks_line() {
+        let text = render(&spec(true)).unwrap();
+        assert!(!text.contains("networks"), "{text}");
+        assert_eq!(network_for(&spec(true)), None);
+        assert!(clone_edits(&spec(true)).unwrap().iter().all(|e| !e.contains("networks")));
+    }
+
+    #[test]
+    fn a_cell_joins_the_lima_network_made_from_its_own_wall_and_network() {
+        let s = on_network("wall_a", "net-1");
+        let name = network_for(&s).unwrap();
+        assert_eq!(name, lima_network_name(&"wall_a".parse().unwrap(), &"net-1".parse().unwrap()));
+        let text = render(&s).unwrap();
+        assert!(text.contains(&format!("\nnetworks:\n- lima: {name}\n")), "{text}");
+        assert_eq!(text.matches("lima:").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_same_network_name_behind_two_walls_never_gives_one_lima_network() {
+        let (a, b) = (on_network("wall_a", "net-1"), on_network("wall_b", "net-1"));
+        let (na, nb) = (network_for(&a).unwrap(), network_for(&b).unwrap());
+        assert_ne!(na, nb);
+        assert!(!render(&a).unwrap().contains(&nb));
+        assert!(!render(&b).unwrap().contains(&na));
+    }
+
+    #[test]
+    fn a_networked_sealed_cell_still_has_no_mounts_and_ignores_every_port() {
+        let mut s = on_network("wall_a", "net-1");
+        let text = render(&s).unwrap();
+        assert!(text.contains("\nmounts: []\n"), "{text}");
+        assert!(text.ends_with("  ignore: true\n"), "{text}");
+        assert_eq!(text.matches("ignore: true").count(), 3);
+        s.mounts.push(mount());
+        let Err(DriverError::Refused(r)) = render(&s) else { panic!("not refused") };
+        assert_eq!(r.code, adytum_model::RefusalCode::SealedCellMount);
+    }
+
+    #[test]
+    fn a_network_does_not_open_a_port_to_the_host() {
+        let mut s = on_network("wall_a", "net-1");
+        s.ports.push(Port { guest: 80, host: 8080, bind: "0.0.0.0".parse().unwrap() });
+        let Err(DriverError::Refused(r)) = render(&s) else { panic!("not refused") };
+        assert_eq!(r.code, adytum_model::RefusalCode::PortNotLocalhost);
+        let text = render(&on_network("wall_a", "net-1")).unwrap();
+        assert!(!text.contains("hostPort"), "{text}");
+    }
+
+    #[test]
+    fn a_clone_is_put_on_its_own_walls_network() {
+        let edits = clone_edits(&on_network("wall_a", "net-1")).unwrap();
+        let name = network_for(&on_network("wall_a", "net-1")).unwrap();
+        assert_eq!(edits.last().unwrap(), &format!(r#".networks = [{{"lima":"{name}"}}]"#));
     }
 }

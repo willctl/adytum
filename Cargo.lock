@@ -79,6 +79,7 @@ dependencies = [
  "adytum-testkit",
  "async-trait",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

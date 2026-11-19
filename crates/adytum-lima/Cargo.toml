@@ -16,6 +16,8 @@ adytum-model.workspace = true
 adytum-policy.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+# Names a network from its wall and name; the digest keeps two walls' networks apart.
+sha2.workspace = true
 
 [dev-dependencies]
 adytum-testkit.workspace = true

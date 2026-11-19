@@ -48,6 +48,7 @@ Each rule starts as a test that proves the refusal.
 - Adytum touches only names that start with `adytum-`. Every driver refuses any other name.
 - Adytum runs Lima in a folder of its own, `~/.adytum/lima` (or under `ADYTUM_HOME`), so the VMs you keep in Lima's default folder are not listed and cannot be reached.
 - Two cells with different walls never share a network, a mount source, a clone source or a secret.
+- A Lima cell with a network joins a private `user-v2` switch named from its wall and network, so two walls never share one; no root is needed. Multicast across it is not promised.
 - A cell that holds an open eidolon is not cloned.
 - A command is a program and an argument list, never a shell string. The child gets an empty environment plus the variables named for it, and the whole process group is stopped at the deadline.
 - The ledger (`~/.adytum/adytum.sqlite`) records a cell before it is created or removed and settles the record after. Every command compares the ledger with what Lima reports first and finishes or removes the difference, so a crash cannot leave a cell behind. A cell the ledger never recorded is listed and never touched.

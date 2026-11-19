@@ -136,6 +136,14 @@ fn other_walls_cannot_share_a_network() {
 }
 
 #[test]
+fn a_cell_with_no_network_is_never_refused_for_one() {
+    let s = spec("adytum-b", "wall_b");
+    let mut theirs = facts("adytum-a", "wall_a");
+    theirs.network = Some("net-1".parse().unwrap());
+    assert!(walls_share_no_network(&s, &world(vec![theirs])).is_ok());
+}
+
+#[test]
 fn same_wall_may_share_a_network_and_other_networks_pass() {
     let mut s = spec("adytum-b", "wall_a");
     s.network = Some("net-1".parse().unwrap());

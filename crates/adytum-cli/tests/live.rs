@@ -392,3 +392,219 @@ fn a_sealed_cell_from_create_to_rm() {
     assert_eq!(default_lima_names(), before);
     println!("total: {:.1}s", total.elapsed().as_secs_f64());
 }
+
+// ---- named networks -------------------------------------------------------
+
+/// Guest side of the datagram checks: `python3 -c UDP role peer_ip` where the
+/// role is `serve` (wait for a datagram, answer it) or `send` (send, wait for
+/// the answer). Prints `got:<text>` or `none`.
+const UDP: &str = r#"
+import socket, sys, time
+role, ip = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(float(sys.argv[3]))
+try:
+    if role == "serve":
+        s.bind(("0.0.0.0", 5005))
+        print("ready", flush=True)
+        data, addr = s.recvfrom(100)
+        s.sendto(b"pong", addr)
+        print("got:" + data.decode())
+    else:
+        time.sleep(2)
+        for _ in range(3):
+            s.sendto(b"ping", (ip, 5005))
+            time.sleep(0.3)
+        data, _ = s.recvfrom(100)
+        print("got:" + data.decode())
+except socket.timeout:
+    print("none")
+"#;
+
+/// Multicast: `serve` joins 239.1.2.3 on the interface address `ip`, `send`
+/// sends to it out of that interface.
+const MCAST: &str = r#"
+import socket, sys, time, struct
+role, ip = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(float(sys.argv[3]))
+try:
+    if role == "serve":
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 5006))
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton("239.1.2.3") + socket.inet_aton(ip))
+        data, _ = s.recvfrom(100)
+        print("got:" + data.decode())
+    else:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+        time.sleep(2)
+        for _ in range(5):
+            s.sendto(b"hello", ("239.1.2.3", 5006))
+            time.sleep(0.3)
+        print("sent")
+except Exception as e:
+    print("none:" + str(e))
+"#;
+
+/// Removes what a failed run leaves: instances and networks in this home.
+struct NetGuard {
+    home: PathBuf,
+}
+
+impl NetGuard {
+    fn limactl(&self, args: &[&str]) {
+        let _ = Command::new("limactl")
+            .args(args)
+            .env_clear()
+            .env("LIMA_HOME", self.home.join("lima"))
+            .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+    }
+}
+
+impl Drop for NetGuard {
+    fn drop(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(self.home.join("lima")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("adytum-test-net-") {
+                    self.limactl(&["delete", "--force", "--tty=false", &name]);
+                }
+            }
+        }
+        let out = Command::new("limactl")
+            .args(["network", "list"])
+            .env_clear()
+            .env("LIMA_HOME", self.home.join("lima"))
+            .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        if let Ok(out) = out {
+            for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+                if let Some(name) = line.split_whitespace().next().filter(|n| n.starts_with("adytum-")) {
+                    self.limactl(&["network", "delete", "--force", "--tty=false", name]);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+fn net_spec(name: &str, wall: &str, network: &str) -> adytum_model::CellSpec {
+    adytum_model::CellSpec {
+        name: name.parse().unwrap(),
+        driver: adytum_model::DriverKind::Lima,
+        image: adytum_lima::image(adytum_lima::DEFAULT_IMAGE).unwrap(),
+        wall: wall.parse().unwrap(),
+        resources: adytum_model::Resources { cpus: 1, memory_mib: 1024, ..adytum_model::Resources::default() },
+        ports: vec![],
+        automation_port: None,
+        mounts: vec![],
+        sealed: true,
+        network: Some(network.parse().unwrap()),
+        clone_from: None,
+        secrets: vec![],
+    }
+}
+
+async fn sh(lima: &adytum_lima::Lima, name: &adytum_model::CellName, argv: Vec<&str>) -> String {
+    use adytum_driver::{Driver, ExecOpts};
+    let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
+    let out = lima.exec(name, &argv, ExecOpts::default()).await.unwrap();
+    out.stdout_lossy().trim().to_owned()
+}
+
+/// The cell's address on the network whose gateway is `gateway`.
+async fn net_ip(lima: &adytum_lima::Lima, name: &adytum_model::CellName, gateway: &str) -> String {
+    let prefix = gateway.rsplit_once('.').unwrap().0.to_owned() + ".";
+    let addrs = sh(lima, name, vec!["sh", "-c", "ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1"]).await;
+    addrs.lines().find(|a| a.starts_with(&prefix)).unwrap_or_else(|| panic!("{name} has no address in {prefix}x: {addrs}")).to_owned()
+}
+
+async fn networks_scenario(env_home: &std::path::Path) {
+    use adytum_driver::Driver;
+    let lima = adytum_lima::Lima::system(adytum_lima::lima_home_in(env_home));
+    let tag = random_tag();
+    let (a1, a2, b1) = (format!("adytum-test-net-a1-{tag}"), format!("adytum-test-net-a2-{tag}"), format!("adytum-test-net-b1-{tag}"));
+    let specs = [net_spec(&a1, "wall_a", "lan"), net_spec(&a2, "wall_a", "lan"), net_spec(&b1, "wall_b", "lan")];
+    let t = Instant::now();
+    for s in &specs {
+        lima.create(s).await.unwrap();
+    }
+    println!("  create 3 cells: {:.2}s", t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    for s in &specs {
+        lima.start(&s.name).await.unwrap();
+    }
+    println!("  start 3 cells: {:.2}s", t.elapsed().as_secs_f64());
+
+    // Two walls, one network name: two Lima networks.
+    let ga = lima.network_gateway(&specs[0]).await.unwrap().expect("wall_a's network exists");
+    let gb = lima.network_gateway(&specs[2]).await.unwrap().expect("wall_b's network exists");
+    assert_ne!(ga, gb);
+    assert_eq!(lima.network_gateway(&specs[1]).await.unwrap(), Some(ga.clone()));
+    let (ip1, ip2, ipb) = (net_ip(&lima, &specs[0].name, &ga).await, net_ip(&lima, &specs[1].name, &ga).await, net_ip(&lima, &specs[2].name, &gb).await);
+    println!("  wall_a network {ga}: {ip1}, {ip2}; wall_b network {gb}: {ipb}");
+
+    // UDP both ways between the two cells of one wall.
+    let t = Instant::now();
+    for (server, client, server_ip) in [(&specs[1].name, &specs[0].name, &ip2), (&specs[0].name, &specs[1].name, &ip1)] {
+        let (srv, cli) =
+            tokio::join!(sh(&lima, server, vec!["python3", "-c", UDP, "serve", "0.0.0.0", "25"]), sh(&lima, client, vec!["python3", "-c", UDP, "send", server_ip, "25"]),);
+        assert!(srv.ends_with("got:ping"), "{server} heard: {srv}");
+        assert_eq!(cli, "got:pong", "{client} heard: {cli}");
+    }
+    println!("  UDP both ways inside the network: {:.2}s", t.elapsed().as_secs_f64());
+
+    // The other wall's cell reaches neither of them.
+    let t = Instant::now();
+    let (srv, cli) =
+        tokio::join!(sh(&lima, &specs[0].name, vec!["python3", "-c", UDP, "serve", "0.0.0.0", "12"]), sh(&lima, &specs[2].name, vec!["python3", "-c", UDP, "send", &ip1, "10"]),);
+    assert!(srv.ends_with("none"), "the other wall's datagram arrived: {srv}");
+    assert_eq!(cli, "none", "the other wall got an answer: {cli}");
+    let (srv, cli) =
+        tokio::join!(sh(&lima, &specs[1].name, vec!["python3", "-c", UDP, "serve", "0.0.0.0", "12"]), sh(&lima, &specs[2].name, vec!["python3", "-c", UDP, "send", &ip2, "10"]),);
+    assert!(srv.ends_with("none") && cli == "none", "{srv} / {cli}");
+    println!("  other wall's UDP refused (nothing arrived): {:.2}s", t.elapsed().as_secs_f64());
+
+    // Multicast: recorded either way.
+    let (rx, tx) =
+        tokio::join!(sh(&lima, &specs[1].name, vec!["python3", "-c", MCAST, "serve", &ip2, "10"]), sh(&lima, &specs[0].name, vec!["python3", "-c", MCAST, "send", &ip1, "10"]),);
+    println!("  MULTICAST between the two cells: receiver says {rx:?}, sender says {tx:?}");
+
+    // The network opens nothing to the host: a guest listener bound to every
+    // address, the network's included, is not on the host.
+    let serve = "nohup python3 -m http.server 18121 --bind 0.0.0.0 >/dev/null 2>&1 &";
+    sh(&lima, &specs[0].name, vec!["sh", "-c", serve]).await;
+    sh(&lima, &specs[0].name, vec!["sh", "-c", "for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:18121/ && exit 0; sleep 0.2; done"]).await;
+    assert!(!listener_reachable(18121), "a guest listener on the network reached the host");
+
+    // Removing the cells removes the networks, the last one with the last cell.
+    let t = Instant::now();
+    lima.remove(&specs[0].name).await.unwrap();
+    assert!(lima.network_gateway(&specs[1]).await.unwrap().is_some(), "wall_a's network went while a cell still used it");
+    lima.remove(&specs[1].name).await.unwrap();
+    assert!(lima.network_gateway(&specs[1]).await.unwrap().is_none(), "wall_a's network outlived its cells");
+    assert!(lima.network_gateway(&specs[2]).await.unwrap().is_some());
+    lima.remove(&specs[2].name).await.unwrap();
+    assert!(lima.network_gateway(&specs[2]).await.unwrap().is_none());
+    println!("  remove 3 cells and their networks: {:.2}s", t.elapsed().as_secs_f64());
+}
+
+#[test]
+fn cells_on_a_named_network_reach_each_other_and_no_one_else() {
+    if std::env::var("ADYTUM_LIVE").as_deref() != Ok("1") {
+        println!("skipped: set ADYTUM_LIVE=1 to run against a real VM");
+        return;
+    }
+    let before = default_lima_names();
+    let guard = NetGuard { home: PathBuf::from("/tmp").join(format!("axn-{}", random_tag())) };
+    println!("networks: ADYTUM_HOME {}", guard.home.display());
+    let total = Instant::now();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(networks_scenario(&guard.home));
+    drop(guard);
+    assert_eq!(default_lima_names(), before);
+    println!("total: {:.1}s", total.elapsed().as_secs_f64());
+}
