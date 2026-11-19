@@ -33,6 +33,10 @@ pub struct ExecOpts {
     pub stdin: Option<Vec<u8>>,
     /// The longest the command may run.
     pub deadline: Option<Duration>,
+    /// Run as root instead of the cell's unprivileged user, for provisioning
+    /// (installing packages, writing system files, starting units). A driver
+    /// that cannot give root refuses with `Unsupported`.
+    pub root: bool,
 }
 
 /// A cell a driver reports.
@@ -56,7 +60,8 @@ pub trait Driver: Send + Sync {
 
     /// Runs a command in the cell. `argv` reaches the guest as separate
     /// arguments, never as a shell string. A command that ran and failed is
-    /// an `Output` with its status, not an error.
+    /// an `Output` with its status, not an error. It runs as the cell's
+    /// unprivileged user unless `opts.root` is set.
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError>;
 
     /// A command's stdin and stdout as one byte stream.

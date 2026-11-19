@@ -16,8 +16,10 @@ use crate::guest::provision_script;
 
 use crate::network::lima_network_name;
 
-/// The guest account's name. The host user's name is never copied in.
-const GUEST_USER: &str = "adytum";
+/// The guest account's name. The host user's name is never copied in. It is
+/// Lima's admin user: `limactl shell` and `limactl copy` log in as it, so
+/// files copied in are owned by it.
+pub const GUEST_USER: &str = "adytum";
 
 /// Guest addresses whose every port is ignored, after the spec's own rules.
 const IGNORE_GUEST_IPS: [&str; 3] = ["127.0.0.1", "0.0.0.0", "::"];

@@ -46,6 +46,35 @@ async fn exec_and_stream_run_as_the_unprivileged_user_and_exec_root_as_root() {
 }
 
 #[tokio::test]
+async fn root_in_the_options_runs_as_root_and_nothing_else_does() {
+    let root = call(&["--", "sudo", "-n", "--", "apt-get", "update"]);
+    let root_env = call(&["--", "sudo", "-n", "--", "env", "K=v", "id"]);
+    let plain = call(&["--", "sudo", "-n", "-u", "cell", "-H", "--", "id"]);
+    let (lima, fake, home) = lima(&[&root, &root_env, &plain]);
+    let name = "adytum-test-golden".parse::<CellName>().expect("a valid name");
+    lima.exec(&name, &args(&["apt-get", "update"]), ExecOpts { root: true, ..ExecOpts::default() }).await.unwrap();
+    lima.exec(&name, &args(&["id"]), ExecOpts { root: true, env: vec![("K".into(), "v".into())], ..ExecOpts::default() }).await.unwrap();
+    // The same options without root go back to the unprivileged user.
+    lima.exec(&name, &args(&["id"]), ExecOpts { root: false, ..ExecOpts::default() }).await.unwrap();
+    fake.assert_done();
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn a_bad_command_is_refused_for_root_in_the_options_too() {
+    let (lima, fake, home) = lima(&[]);
+    let name = "adytum-test-golden".parse::<CellName>().expect("a valid name");
+    let root = || ExecOpts { root: true, ..ExecOpts::default() };
+    assert!(lima.exec(&name, &[], root()).await.is_err());
+    assert!(lima.exec(&name, &args(&["a\0b"]), root()).await.is_err());
+    if let Ok(other) = "xenonet-vm1".parse::<CellName>() {
+        assert!(lima.exec(&other, &args(&["id"]), root()).await.is_err());
+    }
+    fake.assert_done();
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
 async fn a_bad_command_is_refused_for_root_too() {
     let (lima, fake, home) = lima(&[]);
     let name = "adytum-test-golden".parse::<CellName>().expect("a valid name");

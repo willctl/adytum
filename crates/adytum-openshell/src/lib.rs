@@ -211,6 +211,9 @@ impl Driver for OpenShell {
 
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
         let sandbox = sandbox_name(name)?;
+        if opts.root {
+            return Err(refuse("a command as root (OpenShell runs a sandbox's commands as the sandbox's own user)"));
+        }
         let Some(program) = argv.first() else {
             return Err(refuse("an empty command"));
         };

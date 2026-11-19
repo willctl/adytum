@@ -48,7 +48,7 @@ Each rule starts as a test that proves the refusal.
 - Adytum touches only names that start with `adytum-`. Every driver refuses any other name.
 - Adytum runs Lima in a folder of its own, `~/.adytum/lima` (or under `ADYTUM_HOME`), so the VMs you keep in Lima's default folder are not listed and cannot be reached.
 - A Lima cell cannot reach the host: a firewall in the guest drops new connections to 192.168.5.2 (`host.lima.internal`, which Lima maps to the host's 127.0.0.1) and to the private ranges, which holds the host's LAN address. DNS and the internet stay open unless the cell is made with an address allow-list (`Lima::create_with_egress`).
-- A command in a Lima cell runs as the user `cell`, which has no sudo, so the program cannot lift that firewall. `Lima::exec_root` runs a command as root, for provisioning only. Cells made before this change have no such user and must be made again.
+- A command in a Lima cell runs as the user `cell`, which has no sudo, so the program cannot lift that firewall. `ExecOpts { root: true, .. }` runs a command as root, for provisioning only (Lima and OCI give it; OpenShell refuses it; `Lima::exec_root` is the same thing as a method). Cells made before this change have no such user and must be made again.
 - Two cells with different walls never share a network, a mount source, a clone source or a secret.
 - A Lima cell with a network joins a private `user-v2` switch named from its wall and network, so two walls never share one; no root is needed. Multicast across it is not promised.
 - A cell that holds an open eidolon is not cloned.

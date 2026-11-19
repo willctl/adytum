@@ -26,6 +26,7 @@ pub mod template;
 
 pub use guest::{check_guest_path, EXEC_USER};
 pub use pins::{image, image_names, DEFAULT_IMAGE};
+pub use template::GUEST_USER as ADMIN_USER;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -231,29 +232,12 @@ impl Lima {
         Ok(self.limactl().args(["shell", "--workdir=/"]).arg(name.as_str()).arg("--").args(full))
     }
 
-    /// Like [`Driver::exec`], but as root. For provisioning a cell (installing
-    /// packages, writing system files), never for what the cell's own
-    /// programs do: those run as the unprivileged exec user.
+    /// Like [`Driver::exec`], but as root: the same as setting `root` in the
+    /// options. For provisioning a cell (installing packages, writing system
+    /// files), never for what the cell's own programs do: those run as the
+    /// unprivileged exec user.
     pub async fn exec_root(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
-        self.exec_as(name, argv, opts, true).await
-    }
-
-    async fn exec_as(&self, name: &CellName, argv: &[String], opts: ExecOpts, root: bool) -> Result<Output, DriverError> {
-        adytum_policy::name_is_ours(name.as_str())?;
-        self.check_home()?;
-        let mut cmd = self.shell_command(name, argv, &opts.env, root)?;
-        if let Some(bytes) = opts.stdin {
-            cmd = cmd.stdin_bytes(bytes);
-        }
-        if let Some(deadline) = opts.deadline {
-            cmd = cmd.deadline(deadline);
-        }
-        let out = self.runner.run(&cmd, &Cancel::new()).await?;
-        // limactl itself failed (no such instance), as opposed to the command.
-        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
-            return Err(DriverError::NotFound { name: name.to_string() });
-        }
-        Ok(out)
+        self.exec(name, argv, ExecOpts { root: true, ..opts }).await
     }
 
     /// Makes the cell like [`Driver::create`], with the given limit on where
@@ -342,7 +326,21 @@ impl Driver for Lima {
     }
 
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
-        self.exec_as(name, argv, opts, false).await
+        adytum_policy::name_is_ours(name.as_str())?;
+        self.check_home()?;
+        let mut cmd = self.shell_command(name, argv, &opts.env, opts.root)?;
+        if let Some(bytes) = opts.stdin {
+            cmd = cmd.stdin_bytes(bytes);
+        }
+        if let Some(deadline) = opts.deadline {
+            cmd = cmd.deadline(deadline);
+        }
+        let out = self.runner.run(&cmd, &Cancel::new()).await?;
+        // limactl itself failed (no such instance), as opposed to the command.
+        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
+            return Err(DriverError::NotFound { name: name.to_string() });
+        }
+        Ok(out)
     }
 
     async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, DriverError> {

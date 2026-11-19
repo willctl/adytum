@@ -245,7 +245,7 @@ async fn a_name_in_use_by_another_container_is_a_name_taken_refusal() {
 async fn exec_passes_each_argument_as_one_argument_with_no_shell() {
     let script = Script::new(&[(0, "adytum.cell-id\n", "")]);
     let argv = ["sh".to_owned(), "-c".to_owned(), "echo $(id); rm -rf /".to_owned()];
-    let opts = ExecOpts { env: vec![("LANG".to_owned(), "C".to_owned())], stdin: Some(b"in".to_vec()), deadline: None };
+    let opts = ExecOpts { env: vec![("LANG".to_owned(), "C".to_owned())], stdin: Some(b"in".to_vec()), deadline: None, root: false };
     oci(&script, OciTool::Podman).exec(&name("adytum-a"), &argv, opts).await.unwrap();
     let calls = script.calls();
     assert_eq!(calls[1], ["podman", "exec", "-i", "-e", "LANG=C", "adytum-a", "sh", "-c", "echo $(id); rm -rf /"]);
@@ -255,6 +255,18 @@ async fn exec_passes_each_argument_as_one_argument_with_no_shell() {
     assert!(matches!(bad, Err(DriverError::Unsupported { .. })));
     let bad = oci(&script, OciTool::Podman).exec(&name("adytum-a"), &[], ExecOpts::default()).await;
     assert!(matches!(bad, Err(DriverError::Unsupported { .. })));
+}
+
+#[tokio::test]
+async fn root_asks_the_tool_for_the_root_user_and_a_plain_exec_never_does() {
+    let script = Script::new(&[(0, "adytum.cell-id\n", ""), (0, "", ""), (0, "adytum.cell-id\n", ""), (0, "", "")]);
+    let driver = oci(&script, OciTool::Podman);
+    let id = ["id".to_owned()];
+    driver.exec(&name("adytum-a"), &id, ExecOpts { root: true, ..ExecOpts::default() }).await.unwrap();
+    driver.exec(&name("adytum-a"), &id, ExecOpts::default()).await.unwrap();
+    let calls = script.calls();
+    assert_eq!(calls[1], ["podman", "exec", "--user", "root", "adytum-a", "id"]);
+    assert_eq!(calls[3], ["podman", "exec", "adytum-a", "id"]);
 }
 
 #[tokio::test]

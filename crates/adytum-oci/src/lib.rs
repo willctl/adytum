@@ -178,7 +178,7 @@ impl Oci {
         Ok(net)
     }
 
-    fn exec_command(&self, name: &CellName, argv: &[String], env: &[(String, String)], interactive: bool) -> Result<Command, DriverError> {
+    fn exec_command(&self, name: &CellName, argv: &[String], env: &[(String, String)], interactive: bool, root: bool) -> Result<Command, DriverError> {
         if argv.is_empty() {
             return Err(DriverError::Unsupported { what: "an empty command".to_owned() });
         }
@@ -188,6 +188,11 @@ impl Oci {
         let mut cmd = self.tool_cmd().arg("exec");
         if interactive {
             cmd = cmd.arg("-i");
+        }
+        if root {
+            // Without this the command runs as the image's own user, which
+            // is root unless the image sets `USER`.
+            cmd = cmd.args(["--user", "root"]);
         }
         for (key, value) in env {
             let ok = key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -356,7 +361,7 @@ impl Driver for Oci {
 
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
         self.require_ours(name).await?;
-        let mut cmd = self.exec_command(name, argv, &opts.env, opts.stdin.is_some())?;
+        let mut cmd = self.exec_command(name, argv, &opts.env, opts.stdin.is_some(), opts.root)?;
         if let Some(bytes) = opts.stdin {
             cmd = cmd.stdin_bytes(bytes);
         }
@@ -368,7 +373,7 @@ impl Driver for Oci {
 
     async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, DriverError> {
         self.require_ours(name).await?;
-        let cmd = self.exec_command(name, argv, &[], true)?;
+        let cmd = self.exec_command(name, argv, &[], true, false)?;
         Ok(self.runner.duplex(&cmd).await?)
     }
 

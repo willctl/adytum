@@ -58,7 +58,7 @@ async fn the_hand_written_lifecycle_replays() -> Res {
     d.start(&name()).await?;
     let listed = d.list().await?;
     assert_eq!((listed.len(), listed[0].name.as_str(), listed[0].state), (1, NAME, CellState::Running), "a sandbox of someone else's is left out");
-    let opts = ExecOpts { env: vec![("A".into(), "1".into())], stdin: Some(b"in".to_vec()), deadline: Some(std::time::Duration::from_secs(20)) };
+    let opts = ExecOpts { env: vec![("A".into(), "1".into())], stdin: Some(b"in".to_vec()), deadline: Some(std::time::Duration::from_secs(20)), root: false };
     let out = d.exec(&name(), &["echo".into(), "hi there".into()], opts).await?;
     assert_eq!(out.stdout_lossy(), "hi there\n");
     d.copy_in(&name(), Path::new("/tmp/src"), "/workspace").await?;
@@ -91,6 +91,19 @@ async fn what_openshell_cannot_do_is_refused_before_any_command() -> Res {
     let bare = OpenShell::new(fake.clone(), Profile::Native, Host::new(false, None));
     assert!(refused(bare.create(&spec()).await));
     assert!(matches!(d.start(&"adytum-nope".parse()?).await, Err(DriverError::Tool { .. } | DriverError::Exec(_))), "a sandbox the fake never heard of fails there");
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_is_refused_before_any_command() -> Res {
+    // OpenShell runs a sandbox's commands as the sandbox's own user and has
+    // no way to ask for root, so the request is refused rather than run as
+    // someone else.
+    let fake = Arc::new(FakeRunner::from_json(r#"{"tool":"openshell","version":"0","calls":[]}"#)?);
+    let d = driver(&fake);
+    let refused = d.exec(&name(), &["id".into()], ExecOpts { root: true, ..ExecOpts::default() }).await;
+    assert!(matches!(refused, Err(DriverError::Unsupported { .. })), "{refused:?}");
+    fake.assert_done();
     Ok(())
 }
 

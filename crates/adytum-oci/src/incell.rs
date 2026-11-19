@@ -61,7 +61,7 @@ impl Runner for InCell {
         Self::refuse_cwd(cmd)?;
         let argv = Self::argv(cmd);
         let env = Self::vars(cmd).collect();
-        let opts = ExecOpts { env, stdin: cmd.stdin().map(<[u8]>::to_vec), deadline: cmd.deadline_limit() };
+        let opts = ExecOpts { env, stdin: cmd.stdin().map(<[u8]>::to_vec), deadline: cmd.deadline_limit(), ..ExecOpts::default() };
         tokio::select! {
             out = self.driver.exec(&self.cell, &argv, opts) => out.map_err(|e| failed(&e)),
             () = cancel.cancelled() => Ok(Output { cancelled: true, ..Output::default() }),
