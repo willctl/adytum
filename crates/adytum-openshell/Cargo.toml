@@ -1,0 +1,27 @@
+[package]
+name = "adytum-openshell"
+description = "Adytum's OpenShell driver: the argument lists for NVIDIA's openshell CLI (native or through WSL), its JSON, and a Driver over sandboxes."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+adytum-driver.workspace = true
+adytum-exec.workspace = true
+adytum-model.workspace = true
+adytum-policy.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+# The policy file's hash, which a launch compares with the one a preview saw.
+sha2.workspace = true
+
+[dev-dependencies]
+adytum-testkit.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

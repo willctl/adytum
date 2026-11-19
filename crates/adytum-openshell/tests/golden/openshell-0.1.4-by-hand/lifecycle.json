@@ -1,0 +1,14 @@
+{
+  "tool": "openshell",
+  "version": "0.1.4-by-hand",
+  "calls": [
+    { "argv": ["openshell", "sandbox", "list", "-o", "json"], "stdin": null, "stdout": "{\"sandboxes\":[]}", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "create", "--name", "adytum-test-golden", "--from", "example.invalid/agent:1", "--label", "job=adytum-test-golden", "--detach"], "stdin": null, "stdout": "", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "get", "adytum-test-golden", "--output", "json"], "stdin": null, "stdout": "{\"name\":\"adytum-test-golden\",\"phase\":\"Ready\"}", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "list", "-o", "json"], "stdin": null, "stdout": "{\"sandboxes\":[{\"name\":\"adytum-test-golden\",\"phase\":\"Ready\"},{\"name\":\"someone-elses\",\"phase\":\"Ready\"}]}", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "exec", "adytum-test-golden", "--no-login-shell", "--timeout", "20", "--", "env", "A=1", "echo", "hi there"], "stdin": "in", "stdout": "hi there\n", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "upload", "adytum-test-golden", "/tmp/src", "/workspace"], "stdin": null, "stdout": "", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "delete", "adytum-test-golden"], "stdin": null, "stdout": "", "stderr": "", "status": 0 },
+    { "argv": ["openshell", "sandbox", "delete", "adytum-test-golden"], "stdin": null, "stdout": "", "stderr": "sandbox not found", "status": 1 }
+  ]
+}

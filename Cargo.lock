@@ -108,6 +108,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adytum-openshell"
+version = "0.1.0"
+dependencies = [
+ "adytum-driver",
+ "adytum-exec",
+ "adytum-model",
+ "adytum-policy",
+ "adytum-testkit",
+ "async-trait",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "adytum-policy"
 version = "0.1.0"
 dependencies = [

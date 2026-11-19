@@ -21,6 +21,7 @@ adytum-ledger = { path = "crates/adytum-ledger" }
 adytum-lima = { path = "crates/adytum-lima" }
 adytum-model = { path = "crates/adytum-model" }
 adytum-oci = { path = "crates/adytum-oci" }
+adytum-openshell = { path = "crates/adytum-openshell" }
 adytum-policy = { path = "crates/adytum-policy" }
 adytum-testkit = { path = "crates/adytum-testkit" }
 async-trait = "0.1"
