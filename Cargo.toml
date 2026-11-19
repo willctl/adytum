@@ -13,15 +13,12 @@ repository = "https://github.com/willctl/adytum"
 publish = false
 
 [workspace.dependencies]
-adytum-cli = { path = "crates/adytum-cli" }
 adytum-doctor = { path = "crates/adytum-doctor" }
 adytum-driver = { path = "crates/adytum-driver" }
 adytum-exec = { path = "crates/adytum-exec" }
 adytum-ledger = { path = "crates/adytum-ledger" }
 adytum-lima = { path = "crates/adytum-lima" }
 adytum-model = { path = "crates/adytum-model" }
-adytum-oci = { path = "crates/adytum-oci" }
-adytum-openshell = { path = "crates/adytum-openshell" }
 adytum-policy = { path = "crates/adytum-policy" }
 adytum-testkit = { path = "crates/adytum-testkit" }
 async-trait = "0.1"
