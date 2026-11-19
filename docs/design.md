@@ -39,6 +39,8 @@ Each rule's first test is its refusal.
 - A sealed cell has no mounts from the host.
 - Adytum touches only cells it named: every driver refuses a name outside `adytum-*`.
 - Walls: two cells with different walls never share a network, a mount source, a clone source or a secret.
+- A Lima cell cannot reach the host. Lima's user-mode network maps the guest address 192.168.5.2 (`host.lima.internal`, also the default gateway) to the host's 127.0.0.1, so a cell would otherwise reach every loopback service on the host. A firewall in the guest drops new connections to that address and to every private range (which holds the host's own LAN address), except DNS and the cell's own other subnets.
+- A command in a Lima cell runs as an unprivileged user with no sudo, so a program in the cell cannot lift that firewall.
 - A cell that holds an open eidolon is not cloned.
 
 ## Running a command
@@ -47,7 +49,20 @@ Each rule's first test is its refusal.
 
 ## Drivers
 
-A driver implements one trait: `create`, `start`, `exec`, `stream`, `copy_in`, `copy_out`, `stop`, `remove`, `list`, `clone`. `adytum-lima` writes a Lima template from the spec (image by location and digest, no host mounts for a sealed cell, port forwards on 127.0.0.1 only) and runs `limactl` with `--tty=false`. Its golden files pin what `limactl` is asked and what it answers, per pinned Lima version. `adytum-oci` does the same for podman and docker. The `adytum` command makes Lima cells only.
+A driver implements one trait: `create`, `start`, `exec`, `stream`, `copy_in`, `copy_out`, `stop`, `remove`, `list`, `clone`. `adytum-lima` writes a Lima template from the spec (image by location and digest, no host mounts for a sealed cell, port forwards on 127.0.0.1 only, a provisioning script for the guest's firewall and unprivileged user) and runs `limactl` with `--tty=false`. Its golden files pin what `limactl` is asked and what it answers, per pinned Lima version. `adytum-oci` does the same for podman and docker. The `adytum` command makes Lima cells only.
+
+### The wall inside a Lima cell
+
+Lima logs in to a guest as an admin user (`adytum`, passwordless sudo) and, left alone, leaves the guest open to the host. The template therefore carries a provisioning script that Lima runs as root at every boot, before `limactl start` returns and so before any command of Adytum's runs:
+
+- It makes the account `cell`: no password, no sudo rule, no extra groups. `exec` and `stream` run `sudo -n -u cell -H -- <command>` from the admin account, so the program never has the admin account's rights. `Lima::exec_root` runs a command as root for provisioning a cell (installing packages, writing system files); it is a method of the Lima driver, not of the `Driver` trait, and a program in the cell cannot use it.
+- It loads an nftables table `inet adytum` and a systemd unit that loads it again before the network at later boots. A `guard` chain hangs on both the output and the forward hook, so a container inside the cell cannot go round it. In order it: accepts a TCP segment to the host that is not a new connection (the replies to the connections the host opens in, such as Lima's ssh and published ports; this looks at the SYN flag, not at conntrack, so a connection older than the rules still works); accepts UDP port 53 to the resolvers (Lima's own, at 192.168.5.2) and DHCP; drops everything else to 192.168.5.2 and to the default gateway; accepts the subnets the cell itself is on (the peers on a named network, a container bridge), which never include the host's address, as that was dropped before; drops the private ranges 10/8, 172.16/12, 192.168/16, 169.254/16 and 100.64/10, which holds the host's LAN address. Without `nft` in the image the cell does not start.
+- Outbound internet is open by default, because a cell installs software from the network after it is made (Eidolon's browser cell fetches Firefox from Mozilla's repository). `Lima::create_with_egress(spec, &Egress::Only(list))` adds a final drop after an allow-list of IPv4 addresses; `Egress::Only(vec![])` shuts the internet, DNS apart. The list is placed after the host drops, so it cannot reopen the host. It is an argument of the driver, not a field of the spec, and a clone keeps its source's choice.
+- Not covered: IPv6 (Lima's user-mode network gives a guest none), and the host-side address of a named network (it is a host interface, not its loopback).
+- The admin user is still how Lima reaches the guest. The program's account cannot become it: there is no sudo, and the key is the host's.
+- `copy_in` and `copy_out` still go through the admin account (`limactl copy`), so a file copied in is owned by it; put it somewhere the `cell` user can read.
+
+`ADYTUM_LIVE=1 cargo test -p adytum-cli --test firewall` proves it against a real VM: a listener on the host's 127.0.0.1 and one on 0.0.0.0 are unreachable from a cell at 192.168.5.2, `host.lima.internal`, the default gateway and the host's LAN address; `sudo -n true` fails; the exec user cannot flush the rules; DNS resolves; the rules hold after a restart; with an allow-list, a fetch off the list fails.
 
 ### Networks on Lima
 

@@ -201,9 +201,11 @@ fn sealed_cell(before: &[String]) {
     let findmnt = env.exec(&name, &["findmnt", "-n", "-t", "virtiofs,9p,fuse.sshfs"]);
     assert_eq!(findmnt["stdout"], "", "{findmnt}");
 
-    // The user inside is not the host user.
+    // The user inside is not the host user, and not Lima's admin user either:
+    // commands run as an account with no sudo.
     let whoami = env.exec(&name, &["id", "-un"]);
-    assert_eq!(whoami["stdout"], "adytum\n");
+    assert_eq!(whoami["stdout"], "cell\n");
+    assert_ne!(env.exec(&name, &["sudo", "-n", "true"])["status"], 0, "the exec user has sudo");
 
     // A guest listener nobody published is not on the host.
     step("unpublished port", || {
@@ -296,7 +298,7 @@ fn clone_cells() {
     assert_eq!((code, v["state"].as_str()), (0, Some("running")), "{v}");
     let seen = step("exec in the clone", || env.exec(&copy, &["cat", "/var/tmp/marker"]));
     assert_eq!(seen["stdout"], "from-the-source\n", "the clone does not hold the source's disk: {seen}");
-    assert_eq!(env.exec(&copy, &["id", "-un"])["stdout"], "adytum\n");
+    assert_eq!(env.exec(&copy, &["id", "-un"])["stdout"], "cell\n");
     // A clone is its own cell: a change in it does not reach the source.
     assert_eq!(env.exec(&copy, &["rm", "/var/tmp/marker"])["status"], 0);
     assert_eq!(env.json(&["stop", &copy]).0, 0);
@@ -562,10 +564,12 @@ async fn networks_scenario(env_home: &std::path::Path) {
     let (srv, cli) =
         tokio::join!(sh(&lima, &specs[0].name, vec!["python3", "-c", UDP, "serve", "0.0.0.0", "12"]), sh(&lima, &specs[2].name, vec!["python3", "-c", UDP, "send", &ip1, "10"]),);
     assert!(srv.ends_with("none"), "the other wall's datagram arrived: {srv}");
-    assert_eq!(cli, "none", "the other wall got an answer: {cli}");
+    // The guest's firewall refuses the send outright (the script prints
+    // nothing); before it, the datagram was sent and nobody answered.
+    assert!(cli == "none" || cli.is_empty(), "the other wall got an answer: {cli}");
     let (srv, cli) =
         tokio::join!(sh(&lima, &specs[1].name, vec!["python3", "-c", UDP, "serve", "0.0.0.0", "12"]), sh(&lima, &specs[2].name, vec!["python3", "-c", UDP, "send", &ip2, "10"]),);
-    assert!(srv.ends_with("none") && cli == "none", "{srv} / {cli}");
+    assert!(srv.ends_with("none") && (cli == "none" || cli.is_empty()), "{srv} / {cli}");
     println!("  other wall's UDP refused (nothing arrived): {:.2}s", t.elapsed().as_secs_f64());
 
     // Multicast: recorded either way.

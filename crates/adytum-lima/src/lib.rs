@@ -24,7 +24,7 @@ pub mod network;
 mod pins;
 pub mod template;
 
-pub use guest::check_guest_path;
+pub use guest::{check_guest_path, EXEC_USER};
 pub use pins::{image, image_names, DEFAULT_IMAGE};
 
 use std::path::{Path, PathBuf};
@@ -202,14 +202,17 @@ impl Lima {
         self.list().await?.into_iter().find(|c| &c.name == name).map(|c| c.state).ok_or_else(|| DriverError::NotFound { name: name.to_string() })
     }
 
-    fn shell_command(&self, name: &CellName, argv: &[String], env: &[(String, String)]) -> Result<Command, DriverError> {
+    /// `limactl shell` for `argv`, run as the unprivileged exec user, or as
+    /// root for provisioning. Lima logs in as its admin user; the command
+    /// never runs as that user, which keeps the guest's firewall out of reach.
+    fn shell_command(&self, name: &CellName, argv: &[String], env: &[(String, String)], root: bool) -> Result<Command, DriverError> {
         let Some(program) = argv.first() else {
             return Err(DriverError::Unsupported { what: "an empty command".to_owned() });
         };
         if argv.iter().chain(env.iter().flat_map(|(k, v)| [k, v])).any(|a| a.contains('\0')) {
             return Err(DriverError::Unsupported { what: "a NUL byte in a command".to_owned() });
         }
-        let mut cmd = self.limactl().args(["shell", "--workdir=/"]).arg(name.as_str()).arg("--");
+        let mut inner = Vec::new();
         if !env.is_empty() {
             for (key, _) in env {
                 let ok = key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -220,12 +223,61 @@ impl Lima {
             if program.contains('=') {
                 return Err(DriverError::Unsupported { what: "a program name with = in it together with variables".to_owned() });
             }
-            cmd = cmd.arg("env");
-            for (key, value) in env {
-                cmd = cmd.arg(format!("{key}={value}"));
-            }
+            inner.push("env".to_owned());
+            inner.extend(env.iter().map(|(key, value)| format!("{key}={value}")));
         }
-        Ok(cmd.args(argv))
+        inner.extend(argv.iter().cloned());
+        let full = if root { guest::as_root(inner) } else { guest::as_exec_user(inner) };
+        Ok(self.limactl().args(["shell", "--workdir=/"]).arg(name.as_str()).arg("--").args(full))
+    }
+
+    /// Like [`Driver::exec`], but as root. For provisioning a cell (installing
+    /// packages, writing system files), never for what the cell's own
+    /// programs do: those run as the unprivileged exec user.
+    pub async fn exec_root(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
+        self.exec_as(name, argv, opts, true).await
+    }
+
+    async fn exec_as(&self, name: &CellName, argv: &[String], opts: ExecOpts, root: bool) -> Result<Output, DriverError> {
+        adytum_policy::name_is_ours(name.as_str())?;
+        self.check_home()?;
+        let mut cmd = self.shell_command(name, argv, &opts.env, root)?;
+        if let Some(bytes) = opts.stdin {
+            cmd = cmd.stdin_bytes(bytes);
+        }
+        if let Some(deadline) = opts.deadline {
+            cmd = cmd.deadline(deadline);
+        }
+        let out = self.runner.run(&cmd, &Cancel::new()).await?;
+        // limactl itself failed (no such instance), as opposed to the command.
+        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
+            return Err(DriverError::NotFound { name: name.to_string() });
+        }
+        Ok(out)
+    }
+
+    /// Makes the cell like [`Driver::create`], with the given limit on where
+    /// its traffic may go on the internet. `create` itself is `Egress::Open`.
+    pub async fn create_with_egress(&self, spec: &CellSpec, egress: &adytum_model::Egress) -> Result<(), DriverError> {
+        adytum_policy::name_is_ours(spec.name.as_str())?;
+        self.check_home()?;
+        self.check_socket_path(&spec.name)?;
+        // Rendering re-checks the rules that guard the host, before anything is written.
+        let text = template::render_with(spec, egress)?;
+        let file = self.template_path(&spec.name);
+        let dir = file.parent().unwrap_or(&self.home);
+        std::fs::create_dir_all(dir).map_err(|source| DriverError::Io { what: "make the folder for templates", source })?;
+        self.ensure_network(spec).await?;
+        std::fs::write(&file, text).map_err(|source| DriverError::Io { what: "write the template", source })?;
+        let cmd = self.limactl().arg("create").arg(format!("--name={}", spec.name)).arg("--tty=false").arg(&file).deadline(CREATE_DEADLINE);
+        let result = self.run_ok(cmd, "limactl create", &spec.name).await;
+        // The template is only an input; the instance keeps its own copy.
+        let _ = std::fs::remove_file(&file);
+        if result.is_err() {
+            // A network made for a cell that never came to be.
+            self.prune_networks(&template::network_for(spec).into_iter().collect::<Vec<_>>()).await;
+        }
+        result.map(|_| ())
     }
 }
 
@@ -277,25 +329,7 @@ fn host_arg(host: &Path) -> Result<&Path, DriverError> {
 #[async_trait]
 impl Driver for Lima {
     async fn create(&self, spec: &CellSpec) -> Result<(), DriverError> {
-        adytum_policy::name_is_ours(spec.name.as_str())?;
-        self.check_home()?;
-        self.check_socket_path(&spec.name)?;
-        // Rendering re-checks the rules that guard the host, before anything is written.
-        let text = template::render(spec)?;
-        let file = self.template_path(&spec.name);
-        let dir = file.parent().unwrap_or(&self.home);
-        std::fs::create_dir_all(dir).map_err(|source| DriverError::Io { what: "make the folder for templates", source })?;
-        self.ensure_network(spec).await?;
-        std::fs::write(&file, text).map_err(|source| DriverError::Io { what: "write the template", source })?;
-        let cmd = self.limactl().arg("create").arg(format!("--name={}", spec.name)).arg("--tty=false").arg(&file).deadline(CREATE_DEADLINE);
-        let result = self.run_ok(cmd, "limactl create", &spec.name).await;
-        // The template is only an input; the instance keeps its own copy.
-        let _ = std::fs::remove_file(&file);
-        if result.is_err() {
-            // A network made for a cell that never came to be.
-            self.prune_networks(&template::network_for(spec).into_iter().collect::<Vec<_>>()).await;
-        }
-        result.map(|_| ())
+        self.create_with_egress(spec, &adytum_model::Egress::Open).await
     }
 
     async fn start(&self, name: &CellName) -> Result<(), DriverError> {
@@ -308,27 +342,13 @@ impl Driver for Lima {
     }
 
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, DriverError> {
-        adytum_policy::name_is_ours(name.as_str())?;
-        self.check_home()?;
-        let mut cmd = self.shell_command(name, argv, &opts.env)?;
-        if let Some(bytes) = opts.stdin {
-            cmd = cmd.stdin_bytes(bytes);
-        }
-        if let Some(deadline) = opts.deadline {
-            cmd = cmd.deadline(deadline);
-        }
-        let out = self.runner.run(&cmd, &Cancel::new()).await?;
-        // limactl itself failed (no such instance), as opposed to the command.
-        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
-            return Err(DriverError::NotFound { name: name.to_string() });
-        }
-        Ok(out)
+        self.exec_as(name, argv, opts, false).await
     }
 
     async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, DriverError> {
         adytum_policy::name_is_ours(name.as_str())?;
         self.check_home()?;
-        let cmd = self.shell_command(name, argv, &[])?;
+        let cmd = self.shell_command(name, argv, &[], false)?;
         Ok(self.runner.duplex(&cmd).await?)
     }
 
@@ -351,7 +371,7 @@ impl Driver for Lima {
         check_guest_path(guest)?;
         let host = host_arg(host)?;
         // rsync fails on a file given -r, and a folder needs it, so ask the guest.
-        let probe = self.shell_command(name, &["test".to_owned(), "-d".to_owned(), guest.to_owned()], &[])?.deadline(QUICK_DEADLINE);
+        let probe = self.shell_command(name, &["test".to_owned(), "-d".to_owned(), guest.to_owned()], &[], false)?.deadline(QUICK_DEADLINE);
         let probe = self.run(probe, "limactl shell").await?;
         let is_dir = match probe.status {
             Some(0) => true,

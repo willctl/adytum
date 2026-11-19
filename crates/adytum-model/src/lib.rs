@@ -2,12 +2,14 @@
 //! image pins, refusals, and their JSON. No IO beyond asking the system for
 //! random bytes when a new id is made.
 
+mod egress;
 mod error;
 mod ids;
 mod names;
 mod refusal;
 mod spec;
 
+pub use egress::{Egress, Ipv4Net};
 pub use error::ModelError;
 pub use ids::{CellId, ImageId};
 pub use names::{CellName, NetworkName, Wall};

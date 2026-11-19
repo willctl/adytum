@@ -112,7 +112,10 @@ async fn stopping_a_cell_that_does_not_exist_is_not_found() {
 
 #[tokio::test]
 async fn exec_hands_each_argument_over_whole() {
-    let (lima, fake, _home) = lima_with(&[(&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "printf", "%s\n", "$(id)", "a b", ""], "ok", "", 0)], "args");
+    let (lima, fake, _home) = lima_with(
+        &[(&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "sudo", "-n", "-u", "cell", "-H", "--", "printf", "%s\n", "$(id)", "a b", ""], "ok", "", 0)],
+        "args",
+    );
     let argv: Vec<String> = ["printf", "%s\n", "$(id)", "a b", ""].iter().map(|s| (*s).to_owned()).collect();
     let out = lima.exec(&common::name(), &argv, ExecOpts::default()).await.unwrap();
     assert_eq!(out.stdout_lossy(), "ok");
@@ -121,7 +124,10 @@ async fn exec_hands_each_argument_over_whole() {
 
 #[tokio::test]
 async fn exec_variables_go_through_env_and_a_bad_name_is_refused() {
-    let (lima, fake, _home) = lima_with(&[(&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "env", "A=1 2", "sh", "-c", "true"], "", "", 0)], "env");
+    let (lima, fake, _home) = lima_with(
+        &[(&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "sudo", "-n", "-u", "cell", "-H", "--", "env", "A=1 2", "sh", "-c", "true"], "", "", 0)],
+        "env",
+    );
     let argv: Vec<String> = ["sh", "-c", "true"].iter().map(|s| (*s).to_owned()).collect();
     let opts = ExecOpts { env: vec![("A".into(), "1 2".into())], ..ExecOpts::default() };
     lima.exec(&common::name(), &argv, opts).await.unwrap();
@@ -138,7 +144,7 @@ async fn a_missing_cell_is_not_found_from_exec_and_copy() {
     let msg = "time=\"x\" level=fatal msg=\"instance `adytum-test-golden` does not exist, run `limactl create adytum-test-golden` to create a new instance\"\n";
     let (lima, fake, _home) = lima_with(
         &[
-            (&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "true"], "", msg, 1),
+            (&["limactl", "shell", "--workdir=/", "adytum-test-golden", "--", "sudo", "-n", "-u", "cell", "-H", "--", "true"], "", msg, 1),
             (&["limactl", "copy", "--tty=false", "/etc/hostname", "adytum-test-golden:/tmp/x"], "", msg, 1),
         ],
         "missing",

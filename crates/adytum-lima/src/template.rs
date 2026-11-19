@@ -4,10 +4,15 @@
 //! default, every port a guest listens on is forwarded, the host user's name
 //! and login are copied into the guest, and the host's proxy variables are
 //! passed on. The template turns each of those off, so what a cell can see
-//! and reach is what the spec lists and nothing else.
+//! and reach is what the spec lists and nothing else. A boot-time script
+//! (see [`crate::guest::provision_script`]) adds what Lima cannot say: the
+//! unprivileged user commands run as, and the firewall that keeps the host's
+//! loopback out of reach.
 
 use adytum_driver::DriverError;
-use adytum_model::{Arch, CellSpec, DriverKind};
+use adytum_model::{Arch, CellSpec, DriverKind, Egress};
+
+use crate::guest::provision_script;
 
 use crate::network::lima_network_name;
 
@@ -40,6 +45,11 @@ fn unsupported(what: &str) -> DriverError {
 /// policy check first still cannot publish a port or mount a folder it should
 /// not.
 pub fn render(spec: &CellSpec) -> Result<String, DriverError> {
+    render_with(spec, &Egress::default())
+}
+
+/// [`render`], with where the cell's traffic may go on the internet.
+pub fn render_with(spec: &CellSpec, egress: &Egress) -> Result<String, DriverError> {
     adytum_policy::name_is_ours(spec.name.as_str())?;
     adytum_policy::ports_on_localhost(spec)?;
     adytum_policy::automation_port_kept_inside(spec)?;
@@ -104,6 +114,19 @@ pub fn render(spec: &CellSpec) -> Result<String, DriverError> {
     line("user:");
     line(&format!("  name: {GUEST_USER}"));
     line("  comment: \"\"");
+
+    // Runs as root at every boot, before `limactl start` returns: it makes
+    // the unprivileged user commands run as and loads the firewall.
+    line("provision:");
+    line("- mode: system");
+    line("  script: |");
+    for script_line in provision_script(egress).lines() {
+        if script_line.is_empty() {
+            line("");
+        } else {
+            line(&format!("    {script_line}"));
+        }
+    }
 
     // Rules are checked in order and the first match wins: the ports the
     // spec lists, then one rule per guest address that ignores every other
@@ -277,6 +300,44 @@ mod tests {
         assert!(text.contains("propagateProxyEnv: false"));
         assert!(text.contains("forwardAgent: false"));
         assert!(text.contains("containerd:\n  system: false\n  user: false\n"));
+    }
+
+    #[test]
+    fn every_template_provisions_the_exec_user_and_the_firewall_as_root_before_the_ignore_rules() {
+        for sealed in [true, false] {
+            let text = render(&spec(sealed)).unwrap();
+            let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle:?} is missing:\n{text}"));
+            assert!(text.contains("\nprovision:\n- mode: system\n  script: |\n    #!/bin/sh\n"), "{text}");
+            assert!(at("provision:") < at("portForwards:"));
+            assert!(text.contains("      echo \"    ip daddr { $hosts } drop\"\n"));
+            // The block scalar keeps every script line at one indentation or deeper.
+            let script = &text[at("  script: |\n")..at("portForwards:")];
+            assert!(script.lines().skip(1).all(|l| l.is_empty() || l.starts_with("    ")), "{script}");
+        }
+    }
+
+    #[test]
+    fn the_egress_choice_reaches_the_script_and_nothing_else_changes() {
+        let s = spec(true);
+        let open = render_with(&s, &Egress::Open).unwrap();
+        assert_eq!(open, render(&s).unwrap());
+        let only = render_with(&s, &Egress::only(&["203.0.113.9"]).unwrap()).unwrap();
+        assert!(only.contains("    mode=only\n    allowed=\"203.0.113.9/32\"\n"), "{only}");
+        let diff: Vec<_> = only.lines().zip(open.lines()).filter(|(a, b)| a != b).collect();
+        assert_eq!(diff.len(), 2, "{diff:?}");
+        assert_eq!(only.lines().count(), open.lines().count());
+    }
+
+    #[test]
+    fn the_host_wall_is_there_whatever_the_egress_choice() {
+        for egress in [Egress::Open, Egress::Only(vec![]), Egress::only(&["192.168.5.2", "127.0.0.1"]).unwrap()] {
+            let text = render_with(&spec(true), &egress).unwrap();
+            let host_drop = text.find("ip daddr { $hosts } drop").unwrap();
+            // An allow-list entry for the host's address comes after the drop, so it never matches.
+            if let Some(allow) = text.find("ip daddr { $allowed } accept") {
+                assert!(host_drop < allow);
+            }
+        }
     }
 
     #[test]

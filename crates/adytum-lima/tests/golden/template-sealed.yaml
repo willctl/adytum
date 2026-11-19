@@ -20,6 +20,84 @@ propagateProxyEnv: false
 user:
   name: adytum
   comment: ""
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    # Written by adytum. Runs as root at every boot.
+    set -eu
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    user=cell
+    host=192.168.5.2
+    mode=open
+    allowed=""
+
+    # The user every command runs as: no password, no sudo.
+    if ! id -u "$user" >/dev/null 2>&1; then
+      useradd --create-home --shell /bin/bash --user-group "$user"
+    fi
+    passwd -l "$user" >/dev/null 2>&1 || true
+
+    # The firewall. Without nft there is no wall, so the cell does not start.
+    command -v nft >/dev/null 2>&1 || { echo "adytum: nft is missing, so the cell has no firewall" >&2; exit 1; }
+    install -d -m 0755 /etc/adytum
+
+    gateways=$(ip -4 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "via") print $(i + 1) }')
+    hosts=$(printf '%s\n' "$host" $gateways | sort -u | paste -sd, -)
+    resolvers=$(printf '%s\n%s\n' "$host" 192.168.5.3; awk '$1 == "nameserver" && $2 ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ { print $2 }' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null)
+    resolvers=$(printf '%s\n' $resolvers | grep -v '^127[.]' | sort -u | paste -sd, -)
+    # The subnets the cell is on: its named network and its peers, container
+    # bridges. The host's own address and gateway were dropped above, so a subnet
+    # that holds them stays closed to them.
+    own=$(ip -4 -o route show scope link | awk '$1 ~ /^[0-9.]+\/[0-9]+$/ { print $1 }' | sort -u | paste -sd, -)
+
+    {
+      echo "table inet adytum"
+      echo "delete table inet adytum"
+      echo "table inet adytum {"
+      echo "  chain guard {"
+      echo "    ip daddr { $hosts } tcp flags & (syn | ack) != syn accept"
+      echo "    ip daddr { $resolvers } udp dport 53 accept"
+      echo "    ip daddr $host udp sport 68 udp dport 67 accept"
+      echo "    ip daddr { $hosts } drop"
+      [ -n "$own" ] && echo "    ip daddr { $own } accept"
+      echo "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop"
+      if [ "$mode" = only ]; then
+        [ -n "$allowed" ] && echo "    ip daddr { $allowed } accept"
+        echo "    drop"
+      fi
+      echo "  }"
+      echo "  chain output {"
+      echo "    type filter hook output priority 0; policy accept;"
+      echo "    oifname \"lo\" accept"
+      echo "    jump guard"
+      echo "  }"
+      echo "  chain forward {"
+      echo "    type filter hook forward priority 0; policy accept;"
+      echo "    jump guard"
+      echo "  }"
+      echo "}"
+    } > /etc/adytum/firewall.nft.new
+    mv /etc/adytum/firewall.nft.new /etc/adytum/firewall.nft
+    nft -f /etc/adytum/firewall.nft
+
+    cat > /etc/systemd/system/adytum-firewall.service <<'UNIT'
+    [Unit]
+    Description=Adytum cell firewall
+    DefaultDependencies=no
+    Before=network-pre.target
+    Wants=network-pre.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/sbin/nft -f /etc/adytum/firewall.nft
+
+    [Install]
+    WantedBy=sysinit.target
+    UNIT
+    systemctl daemon-reload
+    systemctl enable adytum-firewall.service >/dev/null 2>&1
 portForwards:
 - guestIP: "127.0.0.1"
   proto: any

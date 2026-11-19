@@ -99,6 +99,12 @@
         "--workdir=/",
         "adytum-test-golden-clone",
         "--",
+        "sudo",
+        "-n",
+        "-u",
+        "cell",
+        "-H",
+        "--",
         "uname",
         "-a"
       ],
