@@ -5,7 +5,7 @@
 //! and login are copied into the guest, and the host's proxy variables are
 //! passed on. The template turns each of those off, so what a cell can see
 //! and reach is what the spec lists and nothing else. A boot-time script
-//! (see [`crate::guest::provision_script`]) adds what Lima cannot say: the
+//! (see `guest::provision_script`) adds what Lima cannot say: the
 //! unprivileged user commands run as, and the firewall that keeps the host's
 //! loopback out of reach.
 
