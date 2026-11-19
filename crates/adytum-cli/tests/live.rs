@@ -2,7 +2,7 @@
 //! unless `ADYTUM_LIVE=1`:
 //!
 //! ```text
-//! ADYTUM_LIVE=1 npm run cargo -- test -p adytum-cli --test live -- --nocapture
+//! ADYTUM_LIVE=1 cargo test -p adytum-cli --test live -- --nocapture
 //! ```
 //!
 //! It uses an `ADYTUM_HOME` of its own under /tmp (short, for Lima's unix

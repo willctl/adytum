@@ -2,7 +2,7 @@
 //! driving that podman through `InCell`. Skipped unless `ADYTUM_LIVE=1`:
 //!
 //! ```text
-//! ADYTUM_LIVE=1 npm run cargo -- test -p adytum-oci --test live -- --nocapture
+//! ADYTUM_LIVE=1 cargo test -p adytum-oci --test live -- --nocapture
 //! ```
 //!
 //! Add `ADYTUM_RECORD_GOLDEN=1` to write the podman golden from this run

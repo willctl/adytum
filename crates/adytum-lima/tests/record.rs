@@ -2,7 +2,7 @@
 //! `ADYTUM_LIVE=1` and `ADYTUM_RECORD_GOLDEN=1`:
 //!
 //! ```text
-//! ADYTUM_LIVE=1 ADYTUM_RECORD_GOLDEN=1 npm run cargo -- test -p adytum-lima --test record -- --nocapture
+//! ADYTUM_LIVE=1 ADYTUM_RECORD_GOLDEN=1 cargo test -p adytum-lima --test record -- --nocapture
 //! ```
 //!
 //! It uses a Lima folder of its own under the home folder and removes the

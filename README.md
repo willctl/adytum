@@ -2,14 +2,14 @@
 
 Adytum makes, runs and removes cells on one machine. A cell is a VM, or a container, with one purpose, behind a wall that Adytum keeps apart from every other wall.
 
-It sits beside XenoNet in this repository. XenoNet decides who may do what across machines, and Adytum only acts for the person on the machine it runs on.
+Adytum only acts for the person on the machine it runs on. Who may use which wall is decided by whatever drives it, such as XenoNet across machines. It depends on none of XenoNet's crates.
 
 [Preview the draft marks](brand/drafts.html) for Adytum and Eidolon.
 
 ## Build
 
 ```text
-npm run cargo -- build -p adytum-cli -p eidolon-cli
+cargo build -p adytum-cli
 ```
 
 The binary is `target/debug/adytum`. Cells need [Lima](https://lima-vm.io) 2.1.2 on the machine; `adytum doctor` says what is missing.
@@ -60,7 +60,7 @@ Each rule starts as a test that proves the refusal.
 
 ## Where the code is
 
-`adytum/crates/`, members of the root workspace.
+`crates/`, members of the workspace.
 
 | Crate | Job |
 |---|---|
@@ -78,19 +78,20 @@ Each rule starts as a test that proves the refusal.
 ## Tests
 
 ```text
-npm run cargo -- test -p adytum-cli
-npm run cargo -- test -p adytum-policy
+cargo test -p adytum-cli
+cargo test -p adytum-policy
 ```
 
 The live test makes real VMs, names them `adytum-test-live-*` in a Lima folder of its own, and removes them and the folder at the end, also when a step fails.
 
 ```text
-ADYTUM_LIVE=1 npm run cargo -- test -p adytum-cli --test live -- --nocapture
+ADYTUM_LIVE=1 cargo test -p adytum-cli --test live -- --nocapture
 ```
 
 ## More
 
-- [The guide page](../docs/guide/adytum.md) for using it with XenoNet.
+- [The guide](docs/guide.md) for using it.
 - [Release notes](RELEASES.md).
-- [Eidolon](../eidolon/README.md), which keeps an entity's state and opens it in a cell.
-- [The design](../docs/design/cells.md).
+- Eidolon, a separate tool that keeps an entity's state and opens it in a cell.
+- [The design](docs/design.md).
+- [A cell as a sandbox for XenoNet](docs/xenonet.md), designed and not built.

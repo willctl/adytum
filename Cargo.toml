@@ -1,0 +1,109 @@
+# Adytum: sealed cells, per machine. A cell is a VM or a container that a command, a file copy and a wall can be set on.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+authors = ["willctl"]
+repository = "https://github.com/willctl/adytum"
+publish = false
+
+[workspace.dependencies]
+adytum-cli = { path = "crates/adytum-cli" }
+adytum-doctor = { path = "crates/adytum-doctor" }
+adytum-driver = { path = "crates/adytum-driver" }
+adytum-exec = { path = "crates/adytum-exec" }
+adytum-ledger = { path = "crates/adytum-ledger" }
+adytum-lima = { path = "crates/adytum-lima" }
+adytum-model = { path = "crates/adytum-model" }
+adytum-oci = { path = "crates/adytum-oci" }
+adytum-policy = { path = "crates/adytum-policy" }
+adytum-testkit = { path = "crates/adytum-testkit" }
+async-trait = "0.1"
+getrandom = "0.3"
+nix = { version = "0.28", default-features = false, features = ["signal"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "time", "sync", "process", "signal", "fs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# What a published binary is built with : the
+# whole program optimized as one unit, with no debug info or symbol table.
+# Measured against `release` on the same Mac, the service came out about a
+# third smaller (34.5 MB to 22.1 MB) and 5-10% quicker to scan and search,
+# for a build about three times as long, so local release builds stay on
+# `release`. Panic messages keep their file and line
+# without symbols.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = 0
+strip = "symbols"
+
+# What the compiler and clippy hold the Rust core to (XenoNet's docs/design/rust-core.md,
+# "Static analysis"). Each crate takes these with `[lints] workspace = true`,
+# and CI fails on any warning. Code that needs an exception says why where it
+# makes it, with #[expect(lint, reason = "...")].
+[workspace.lints.rust]
+# unsafe only where a crate or module says why: a libc call, an OS call.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# The default groups (correctness, suspicious, style, complexity, perf) and
+# pedantic, less the pedantic checks below that are taste rather than bugs.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+needless_pass_by_value = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+items_after_statements = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+unreadable_literal = "allow"
+single_match_else = "allow"
+if_not_else = "allow"
+match_same_arms = "allow"
+implicit_hasher = "allow"
+# Sizes, offsets and counts are converted with intent, and floats are
+# compared exactly where a value was just stored.
+float_cmp = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# The service runs for days, so nothing a person or a file can reach may
+# panic it. expect stays for a real invariant, with the reason as its
+# message. Tests may do all of these (clippy.toml).
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+# stdout is the MCP servers' protocol and the command's output, so nothing
+# else prints there. stderr is the log.
+print_stdout = "warn"
+undocumented_unsafe_blocks = "warn"
+# #[expect] rather than #[allow], so an exception no longer needed shows,
+# and each one says why.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
