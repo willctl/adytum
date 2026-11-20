@@ -391,6 +391,11 @@ fn copy(from: &Path, to: &Path) -> Result<(), Error> {
             }
             #[cfg(unix)]
             std::os::unix::fs::symlink(target, &dst).map_err(io("make a symlink"))?;
+            #[cfg(not(unix))]
+            return Err(Error::Io {
+                what: "copy a symlink",
+                source: io::Error::new(io::ErrorKind::Unsupported, format!("the fake driver copies symlinks only on Unix: {}", target.display())),
+            });
         } else if kind.is_dir() {
             copy(&src, &dst)?;
             std::fs::set_permissions(&dst, std::fs::metadata(&src).map_err(io("look at a folder"))?.permissions()).map_err(io("set a folder's mode"))?;
