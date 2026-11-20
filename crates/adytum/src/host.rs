@@ -98,6 +98,7 @@ pub trait Drivers: Send + Sync {
 #[cfg(feature = "lima")]
 #[derive(Debug, Clone)]
 pub struct SystemDrivers {
+    #[cfg_attr(not(unix), expect(dead_code, reason = "Lima cells run only on Mac and Linux hosts"))]
     lima_home: PathBuf,
 }
 
