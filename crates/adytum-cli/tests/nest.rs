@@ -9,6 +9,8 @@
 //! cells `adytum-test-nest-*`, and removes them and the folder at the end,
 //! also when a step fails.
 
+// It checks Unix file modes, so it builds only on Unix hosts.
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,

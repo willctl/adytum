@@ -14,6 +14,8 @@
 //! create` killed with `kill -9` while Lima is making the instance, then the
 //! next command reconciles it away).
 
+// It checks Unix file modes, so it builds only on Unix hosts.
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
