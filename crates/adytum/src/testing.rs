@@ -212,6 +212,7 @@ struct FakeState {
     cells: BTreeMap<CellName, CellState>,
     specs: BTreeMap<CellName, CellSpec>,
     faults: Vec<(Op, Leaves)>,
+    list_faults: Vec<Option<CellName>>,
     calls: Vec<DriverCall>,
 }
 
@@ -272,6 +273,12 @@ impl FakeDriver {
     /// Makes the next call of `op` fail, leaving what `leaves` says.
     pub fn fail_next(&self, op: Op, leaves: Leaves) {
         lock(&self.state).faults.push((op, leaves));
+    }
+
+    /// Makes the next listing of the cells in `host` fail (`None` is this
+    /// machine), as when a daemon there is down.
+    pub fn fail_next_list(&self, host: Option<&CellName>) {
+        lock(&self.state).list_faults.push(host.cloned());
     }
 
     pub fn state(&self, name: &CellName) -> Option<CellState> {
@@ -468,8 +475,12 @@ impl Driver for FakeDriver {
     }
 
     async fn list(&self) -> Result<Vec<Listed>, Error> {
-        let st = lock(&self.state);
+        let mut st = lock(&self.state);
         self.reach(&st)?;
+        if let Some(at) = st.list_faults.iter().position(|h| h == &self.host) {
+            st.list_faults.remove(at);
+            return Err(Error::Tool { what: "the fake driver's list".to_owned(), status: Some(1), stderr: "the daemon is down".to_owned() });
+        }
         let here = |name: &CellName| st.specs.get(name).and_then(|s| s.parent.as_ref()) == self.host.as_ref();
         Ok(st.cells.iter().filter(|(name, _)| here(name)).map(|(name, state)| Listed { name: name.clone(), state: *state }).collect())
     }

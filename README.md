@@ -39,7 +39,7 @@ adytum ls                                # adytum-job is indented under adytum-b
 adytum rm adytum-box                     # removes adytum-job first
 ```
 
-A container cell keeps its parent's wall and is sealed when its parent is. Its image is pinned by digest. It runs as user 1000 with every capability dropped and no way to gain one, and a sealed one has no network. It publishes no ports and mounts nothing. Without `--parent` a container cell runs through `docker` on this machine.
+A container cell keeps its parent's wall, is sealed when its parent is, and gets its parent's CPUs and memory unless given less. Its image is pinned by digest. It runs as user 1000 with every capability dropped and no way to gain one, and a sealed one has no network. It publishes no ports and mounts nothing. Without `--parent` a container cell runs through `docker` on this machine.
 
 `--nested-virtualization` on a Lima cell lets programs in it run VMs of their own, on a Mac with an M3 or later chip and macOS 15 or later.
 

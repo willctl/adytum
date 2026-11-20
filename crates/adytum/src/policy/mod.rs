@@ -109,6 +109,19 @@ fn parent_can_hold_it(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
     if parent.spec.sealed && !spec.sealed {
         return Err(Refusal::new(RefusalCode::ParentSealed, format!("{name} is sealed, so {} must be sealed too.", spec.name), "Make the cell sealed."));
     }
+    let (have, want) = (parent.spec.resources, spec.resources);
+    // A container's disk is its parent's, so only a VM's disk must fit.
+    let disk_too_big = spec.kind.name() == crate::KindName::Lima && want.disk_gib > have.disk_gib;
+    if want.cpus > have.cpus || want.memory_mib > have.memory_mib || disk_too_big {
+        return Err(Refusal::new(
+            RefusalCode::ChildTooBig,
+            format!(
+                "{} asks for {} CPUs, {} MiB and {} GiB, more than its parent {name} has ({} CPUs, {} MiB, {} GiB).",
+                spec.name, want.cpus, want.memory_mib, want.disk_gib, have.cpus, have.memory_mib, have.disk_gib
+            ),
+            "Give the cell no more than its parent has, or give the parent more.",
+        ));
+    }
     let depth = ancestors(cells, name).len() + 1;
     if depth > MAX_DEPTH {
         return Err(Refusal::new(

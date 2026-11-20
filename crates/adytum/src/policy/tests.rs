@@ -280,6 +280,24 @@ fn a_cell_too_deep_is_refused() {
 }
 
 #[test]
+fn a_child_asks_for_no_more_than_its_parent_has() {
+    let p = host("adytum-p", "wall_a");
+    let have = p.spec.resources;
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.resources = have;
+    assert!(check_create(&s, std::slice::from_ref(&p)).is_ok(), "as much as the parent is fine");
+    for want in [Resources { cpus: have.cpus + 1, ..have }, Resources { memory_mib: have.memory_mib + 1, ..have }] {
+        s.resources = want;
+        let r = check_create(&s, std::slice::from_ref(&p)).err().unwrap();
+        assert_eq!(r.code, RefusalCode::ChildTooBig);
+        assert!(r.message.contains("adytum-p") && !r.fix.is_empty(), "{r:?}");
+    }
+    // A container's disk is the parent's own; it is not compared.
+    s.resources = Resources { disk_gib: have.disk_gib * 10, ..have };
+    assert!(check_create(&s, &[p]).is_ok());
+}
+
+#[test]
 fn a_clone_is_made_where_its_source_runs() {
     let source = Cell { id: CellId::from_bytes([2; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Stopped };
     let cells = [host("adytum-p", "wall_a"), host("adytum-q", "wall_a"), source];

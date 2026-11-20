@@ -395,3 +395,27 @@ async fn a_lima_cell_can_ask_for_containers_and_nested_virtualization() {
     let adytum::Kind::Lima(options) = spec.kind else { panic!("{spec:?}") };
     assert!(options.containers && options.nested_virtualization);
 }
+
+#[tokio::test]
+async fn a_child_gets_its_parents_resources_unless_told_less_and_more_is_refused() {
+    let rig = Rig::new("sizes");
+    assert_eq!(rig.go("create adytum-test-p --containers --cpus 1 --memory 1024").await.code, 0);
+    assert_eq!(rig.go(&format!("create adytum-test-c --kind container --parent adytum-test-p --image {IMAGE}")).await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-c".parse().unwrap()).unwrap();
+    assert_eq!((spec.resources.cpus, spec.resources.memory_mib), (1, 1024));
+    let r = rig.go(&format!("create adytum-test-d --kind container --parent adytum-test-p --image {IMAGE} --cpus 2 --json")).await;
+    assert_eq!(r.json()["error"]["code"], "child_too_big");
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_list_is_said_and_the_command_still_runs() {
+    let rig = Rig::new("unlisted");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    rig.driver.fail_next_list(None);
+    let r = rig.go("ls --json").await;
+    assert_eq!(r.code, 0, "{}", r.out);
+    assert_eq!(r.json()["reconciled"]["unlisted"][0]["kind"], "lima");
+    assert!(r.json()["reconciled"]["unlisted"][0]["host"].is_null());
+    assert!(r.err.contains("could not list the Lima cells on this machine"), "{}", r.err);
+    assert_eq!(r.json()["cells"][0]["name"], "adytum-test-a", "left as recorded");
+}

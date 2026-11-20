@@ -38,6 +38,7 @@ The rules for a cell with a parent, each with its own refusal code:
 - The child is behind the parent's wall (`parent_wall`), so a cell never holds another wall's cells.
 - The parent's kind can run the child's kind (`parent_cannot_host`).
 - A sealed parent holds only sealed cells (`parent_sealed`).
+- The child asks for no more CPUs or memory than its parent has, and a VM child no more disk (`child_too_big`). Each child is held to this alone: they are limits, not reservations, so cells in one parent can ask for its whole size each.
 - A nested cell publishes no ports (`nested_port`) and mounts nothing from this machine (`nested_mount`): its ports would open inside the parent, and its mounts would come from the parent, where no rule here can see them.
 - At most three cells stand between this machine and a cell (`too_deep`).
 - A clone is made where its source runs (`clone_host`).
@@ -82,7 +83,7 @@ A `Command` is a program and an argument list, never a shell string. The child s
 
 `<ADYTUM_HOME>/adytum.sqlite` records each create, start, stop and remove before the driver runs and settles it after. A crash at any point leaves an open operation. Each cell's row names its parent's row, and goes when that row goes (`ON DELETE CASCADE`), so the records of the cells inside a removed cell go in the same transaction.
 
-`Cells::reconcile` walks the hosts from this machine down. On each host it finishes or undoes the open operations of the cells there, then makes the ledger agree with what the host's drivers list, then goes on into each running cell that holds recorded cells. The cells inside a cell that is not running are left as they are recorded, open operations included, until their host runs again or goes. An open operation whose cell went with its parent is settled. A cell a host has and the ledger never recorded is reported and never touched, so Adytum deletes only what it wrote down.
+`Cells::reconcile` walks the hosts from this machine down. On each host it finishes or undoes the open operations of the cells there, then makes the ledger agree with what the host's drivers list, then goes on into each running cell that holds recorded cells. The cells inside a cell that is not running are left as they are recorded, open operations included, until their host runs again or goes. An open operation whose cell went with its parent is settled. A cell a host has and the ledger never recorded is reported and never touched, so Adytum deletes only what it wrote down. A host whose cells of a kind cannot be listed, such as a cell whose container daemon is down, is reported in `Report::unlisted`; its cells of that kind are left as recorded and not visited, and the rest of the walk goes on.
 
 Writes are `BEGIN IMMEDIATE` transactions with `synchronous = FULL`, so a record said to be written survives a power cut. `PRAGMA user_version` is a hash of the schema text, and a file with another hash is refused and left as it is; the refusal's fix says how to start over.
 

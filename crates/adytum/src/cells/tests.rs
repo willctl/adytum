@@ -554,3 +554,24 @@ fn a_ledger_this_adytum_cannot_read_says_how_to_start_over() {
     let fix = Error::SetUpAgain("x".to_owned()).fix().to_owned();
     assert!(fix.contains("limactl delete") && fix.contains("move adytum.sqlite"), "{fix}");
 }
+
+#[tokio::test]
+async fn a_host_that_cannot_list_is_reported_and_the_rest_is_reconciled() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.create(&spec("adytum-test-other")?).await?;
+    driver.lose(&name("adytum-test-other")?);
+    driver.lose(&name("adytum-test-c")?);
+    driver.fail_next_list(Some(&name("adytum-test-p")?));
+    let report = cells.reconcile().await?;
+    assert_eq!(report.removed, [name("adytum-test-other")?], "this machine was still reconciled");
+    let unlisted: Vec<(Option<CellName>, crate::KindName)> = report.unlisted.iter().map(|u| (u.host.clone(), u.kind)).collect();
+    assert_eq!(unlisted, [(Some(name("adytum-test-p")?), crate::KindName::Container)]);
+    assert!(report.unlisted[0].error.contains("the daemon is down"), "{:?}", report.unlisted);
+    assert_eq!(state_of(&cells, "adytum-test-c"), Some(CellState::Stopped), "left as recorded");
+    // Once the host lists again, the lost cell goes.
+    let report = cells.reconcile().await?;
+    assert_eq!((report.removed, report.unlisted), (vec![name("adytum-test-c")?], vec![]));
+    Ok(())
+}

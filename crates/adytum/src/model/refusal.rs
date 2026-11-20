@@ -22,6 +22,7 @@ pub enum RefusalCode {
     NestedMount,
     TooDeep,
     CloneHost,
+    ChildTooBig,
 }
 
 impl RefusalCode {
@@ -43,6 +44,7 @@ impl RefusalCode {
             Self::NestedMount => "nested_mount",
             Self::TooDeep => "too_deep",
             Self::CloneHost => "clone_host",
+            Self::ChildTooBig => "child_too_big",
         }
     }
 }
@@ -93,6 +95,7 @@ mod tests {
             (RefusalCode::NestedMount, "nested_mount"),
             (RefusalCode::TooDeep, "too_deep"),
             (RefusalCode::CloneHost, "clone_host"),
+            (RefusalCode::ChildTooBig, "child_too_big"),
         ];
         for (code, text) in pairs {
             assert_eq!(code.as_str(), text);

@@ -19,7 +19,7 @@ pub mod openshell;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use cells::{home, Cells, Report};
+pub use cells::{home, Cells, Report, Unlisted};
 pub use driver::*;
 pub use error::{Error, Result};
 pub use host::*;

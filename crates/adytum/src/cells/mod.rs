@@ -32,6 +32,17 @@ pub struct Report {
     pub removed: Vec<CellName>,
     pub finished: Vec<CellName>,
     pub unrecorded: Vec<CellName>,
+    /// Hosts whose cells of a kind could not be listed. Those cells are left
+    /// as they are recorded, and the cells inside them are not visited.
+    pub unlisted: Vec<Unlisted>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unlisted {
+    /// `None` is this machine.
+    pub host: Option<CellName>,
+    pub kind: KindName,
+    pub error: String,
 }
 
 /// The cells of one Adytum folder: a ledger that records each create,
@@ -102,10 +113,11 @@ impl Cells {
         while let Some(host) = hosts.pop_front() {
             self.reconcile_host(host.as_ref(), &mut report).await?;
             let cells = self.list()?;
+            let unlisted = |c: &Cell| report.unlisted.iter().any(|u| u.host == host && u.kind == c.spec.kind.name());
             hosts.extend(
                 cells
                     .iter()
-                    .filter(|c| c.spec.parent == host && c.state == CellState::Running && cells.iter().any(|d| d.spec.parent.as_ref() == Some(&c.spec.name)))
+                    .filter(|c| c.spec.parent == host && c.state == CellState::Running && !unlisted(c) && cells.iter().any(|d| d.spec.parent.as_ref() == Some(&c.spec.name)))
                     .map(|c| Some(c.spec.name.clone())),
             );
         }
@@ -125,10 +137,17 @@ impl Cells {
         }
         let on = self.host(&cells, host)?;
         let mut listed = Vec::new();
+        let mut failed = Vec::new();
         for kind in kinds {
-            listed.extend(self.drivers.driver(kind, on.clone())?.list().await?);
+            match self.drivers.driver(kind, on.clone()) {
+                Ok(driver) => match driver.list().await {
+                    Ok(cells) => listed.extend(cells),
+                    Err(e) => failed.push(Unlisted { host: host.cloned(), kind, error: e.to_string() }),
+                },
+                Err(e) => failed.push(Unlisted { host: host.cloned(), kind, error: e.to_string() }),
+            }
         }
-        for cell in here(&cells) {
+        for cell in here(&cells).into_iter().filter(|c| !failed.iter().any(|u| u.kind == c.spec.kind.name())) {
             let name = &cell.spec.name;
             match listed.iter().find(|l| &l.name == name) {
                 // The cells that ran in it went with it.
@@ -146,6 +165,7 @@ impl Cells {
                 report.unrecorded.push(l.name);
             }
         }
+        report.unlisted.extend(failed);
         Ok(())
     }
 

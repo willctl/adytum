@@ -24,11 +24,16 @@ impl Session {
                 let _ = writeln!(err, "adytum: reconciled: {what} {name}.");
             }
         }
+        for u in &report.unlisted {
+            let host = u.host.as_ref().map_or_else(|| "this machine".to_owned(), ToString::to_string);
+            let _ = writeln!(err, "adytum: could not list the {:?} cells on {host}, so they are left as recorded: {}", u.kind, u.error);
+        }
         Ok(Session { cells, report })
     }
 
     fn reconciled(&self) -> Value {
-        json!({ "removed": self.report.removed, "finished": self.report.finished, "unrecorded": self.report.unrecorded })
+        let unlisted: Vec<Value> = self.report.unlisted.iter().map(|u| json!({ "host": u.host, "kind": u.kind, "error": u.error })).collect();
+        json!({ "removed": self.report.removed, "finished": self.report.finished, "unrecorded": self.report.unrecorded, "unlisted": unlisted })
     }
 
     fn done(&self, mut json: Value, text: String) -> Done {
@@ -119,7 +124,8 @@ fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result
         (None, Some(parent)) => parent.spec.wall.clone(),
         (None, None) => DEFAULT_WALL.parse::<Wall>().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))?,
     };
-    let defaults = Resources::default();
+    // A cell in a cell may use what its parent has, unless told less.
+    let defaults = parent.map_or_else(Resources::default, |p| p.spec.resources);
     let resources = Resources { cpus: args.cpus.unwrap_or(defaults.cpus), memory_mib: args.memory_mib.unwrap_or(defaults.memory_mib), disk_gib: defaults.disk_gib };
     if resources.cpus == 0 || resources.memory_mib == 0 {
         return Err(usage("A cell needs at least one CPU and some memory.", "Give --cpus and --memory a number above 0."));
