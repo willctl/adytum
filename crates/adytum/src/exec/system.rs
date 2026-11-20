@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::exec::duplex::{Duplex, DuplexControl};
@@ -90,6 +91,22 @@ where
     })
 }
 
+/// Chunks of a pipe as they come, so stderr can be shown while the child
+/// runs and is never left to fill its pipe.
+async fn forward_chunks<R: AsyncRead + Unpin>(mut pipe: R, send: UnboundedSender<Vec<u8>>) {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if send.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn write_stdin(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
     let _ = stdin.write_all(&bytes).await;
     let _ = stdin.shutdown().await;
@@ -149,8 +166,9 @@ impl Runner for SystemRunner {
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(Error::Child { what: "open the command's pipes", source: std::io::Error::other("the pipes were not created") });
         };
-        let stderr = child.stderr.take().map(spawn_reader);
-        let control = SystemControl { child, pgid, stderr, deadline: cmd.deadline_limit(), grace: self.grace };
+        let (send, stderr) = tokio::sync::mpsc::unbounded_channel();
+        let reader = child.stderr.take().map(|pipe| tokio::spawn(forward_chunks(pipe, send)));
+        let control = SystemControl { child, pgid, stderr: Some(stderr), reader, deadline: cmd.deadline_limit(), grace: self.grace };
         Ok(Duplex::from_parts(Box::new(stdout), Box::new(stdin), Box::new(control)))
     }
 }
@@ -158,7 +176,8 @@ impl Runner for SystemRunner {
 struct SystemControl {
     child: Child,
     pgid: Option<u32>,
-    stderr: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<UnboundedReceiver<Vec<u8>>>,
+    reader: Option<JoinHandle<()>>,
     deadline: Option<Duration>,
     grace: Duration,
 }
@@ -178,8 +197,24 @@ impl DuplexControl for SystemControl {
             },
             None => self.child.wait().await.map_err(|source| Error::Child { what: "wait for the command", source })?.code(),
         };
-        let stderr = collect(self.stderr.take(), !timed_out).await;
+        if let Some(reader) = self.reader.take() {
+            if timed_out {
+                let _ = tokio::time::timeout(Duration::from_secs(1), reader).await;
+            } else {
+                let _ = reader.await;
+            }
+        }
+        let mut stderr = Vec::new();
+        if let Some(chunks) = self.stderr.as_mut() {
+            while let Ok(chunk) = chunks.try_recv() {
+                stderr.extend_from_slice(&chunk);
+            }
+        }
         Ok(Output { status: code, stdout: Vec::new(), stderr, timed_out })
+    }
+
+    fn take_stderr(&mut self) -> Option<UnboundedReceiver<Vec<u8>>> {
+        self.stderr.take()
     }
 
     fn kill(&mut self) {

@@ -182,11 +182,23 @@ async fn clone(ctx: &Context, err: &mut dyn Write, from: &CellName, to: CellName
     ))
 }
 
+/// Input that is not a terminal is forwarded to the command through a
+/// stream, and its output is written as it comes. The exit code is the
+/// command's own, or 1 when it did not exit by itself.
 async fn exec(ctx: &Context, name: &str, argv: &[String], out: &mut dyn Write, err: &mut dyn Write, json: bool) -> Result<Done, Failure> {
     let name = name.parse::<CellName>()?;
     let session = Session::open(ctx, err).await?;
-    let output = session.cells.driver_of(&name)?.exec(&name, argv, ExecOpts::default()).await?;
-    let exit = i32::from(!output.success());
+    let driver = session.cells.driver_of(&name)?;
+    let input = ctx.input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    let output = match input {
+        Some(input) => forward(&*driver, &name, argv, input, if json { None } else { Some((&mut *out, &mut *err)) }).await?,
+        None => driver.exec(&name, argv, ExecOpts::default()).await?,
+    };
+    let exit = match (output.success(), output.status) {
+        (true, _) => 0,
+        (false, Some(code)) if code != 0 => code,
+        _ => 1,
+    };
     if json {
         let status = output.status;
         let mut done = session.done(json!({ "name": name, "status": status, "stdout": output.stdout_lossy(), "stderr": output.stderr_lossy() }), String::new());
@@ -200,6 +212,57 @@ async fn exec(ctx: &Context, name: &str, argv: &[String], out: &mut dyn Write, e
         let _ = writeln!(err, "adytum: the command {how}.");
     }
     Ok(Done { json: json!({}), text: String::new(), exit })
+}
+
+/// Runs `argv` on a stream: `input` goes to its stdin, and its stdout and
+/// stderr go to `shown` as they come, or into the returned output when
+/// `shown` is `None`.
+async fn forward(
+    driver: &dyn adytum::Driver,
+    name: &CellName,
+    argv: &[String],
+    mut input: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    shown: Option<(&mut dyn Write, &mut dyn Write)>,
+) -> Result<adytum::exec::Output, Failure> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut duplex = driver.stream(name, argv, ExecOpts::default()).await?;
+    let (mut out, mut err) = shown.map_or((None, None), |(o, e)| (Some(o), Some(e)));
+    let mut errors = if err.is_some() { duplex.take_stderr() } else { None };
+    let (mut from, mut to) = tokio::io::split(duplex);
+    // A command that stops reading early closes the pipe; that is its business.
+    let feed = async {
+        let _ = tokio::io::copy(&mut input, &mut to).await;
+        let _ = to.shutdown().await;
+    };
+    let mut kept = Vec::new();
+    let drain = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = from.read(&mut buf).await.map_err(|source| adytum::Error::Io { what: "read the command's output", source })?;
+            if n == 0 {
+                return Ok::<(), adytum::Error>(());
+            }
+            match out.as_mut() {
+                Some(out) => {
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                }
+                None => kept.extend_from_slice(&buf[..n]),
+            }
+        }
+    };
+    let show_errors = async {
+        let (Some(chunks), Some(err)) = (errors.as_mut(), err.as_mut()) else { return };
+        while let Some(chunk) = chunks.recv().await {
+            let _ = err.write_all(&chunk);
+            let _ = err.flush();
+        }
+    };
+    let ((), drained, ()) = tokio::join!(feed, drain, show_errors);
+    let mut output = from.unsplit(to).finish().await?;
+    drained?;
+    output.stdout = kept;
+    Ok(output)
 }
 
 /// `<name>:<path>` is a path inside a cell; anything else is on the host.

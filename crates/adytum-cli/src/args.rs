@@ -78,6 +78,8 @@ Usage:
                                          (<from> must be stopped; the copy
                                           keeps its wall unless you give one)
   adytum exec <name> -- <command> [args...]
+                                         (stdin that is not a terminal goes to
+                                          the command; exits with its code)
   adytum cp [--owner user] <source> <destination>
                                          (one side is <name>:<absolute path>;
                                           --owner writes a copy into a cell
@@ -88,7 +90,8 @@ Usage:
 
 Every command takes --json: one JSON object on stdout, and errors as
 {\"error\": {\"code\", \"message\", \"fix\"}}.
-Exit codes: 0 done, 1 refused or failed, 2 usage error.
+Exit codes: 0 done, 1 refused or failed, 2 usage error; exec exits with the
+command's own code.
 Cells are named adytum-<lowercase letters, digits, dashes>.
 ";
 

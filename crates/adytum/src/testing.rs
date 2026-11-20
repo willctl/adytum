@@ -113,9 +113,15 @@ struct Replayed(Output);
 /// A [`Duplex`] whose other end is the stream returned beside it, for a
 /// test that plays the program at that end.
 pub fn duplex() -> (Duplex, DuplexStream) {
+    duplex_ending(Output::default())
+}
+
+/// As [`duplex`], for a program that ends as `end` says when the duplex is
+/// finished.
+pub fn duplex_ending(end: Output) -> (Duplex, DuplexStream) {
     let (ours, theirs) = tokio::io::duplex(1 << 16);
     let (read, write) = tokio::io::split(ours);
-    (Duplex::from_parts(Box::new(read), Box::new(write), Box::new(Replayed(Output::default()))), theirs)
+    (Duplex::from_parts(Box::new(read), Box::new(write), Box::new(Replayed(end))), theirs)
 }
 
 #[async_trait]

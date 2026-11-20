@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::exec::Output;
 use crate::Error;
@@ -13,6 +14,12 @@ pub trait DuplexControl: Send {
     async fn finish(self: Box<Self>) -> Result<Output, Error>;
 
     fn kill(&mut self);
+
+    /// The child's stderr as it comes, if it can be had apart; once taken,
+    /// `finish` leaves it out of its output.
+    fn take_stderr(&mut self) -> Option<UnboundedReceiver<Vec<u8>>> {
+        None
+    }
 }
 
 /// A child's stdin and stdout as one byte stream. Shutting it down closes
@@ -40,6 +47,13 @@ impl Duplex {
 
     pub fn kill(&mut self) {
         self.control.kill();
+    }
+
+    /// The child's stderr in chunks as it comes, for a caller that shows it
+    /// while the child runs. `None` when the far end cannot give it apart,
+    /// or it was taken already; then `finish` has it.
+    pub fn take_stderr(&mut self) -> Option<UnboundedReceiver<Vec<u8>>> {
+        self.control.take_stderr()
     }
 }
 

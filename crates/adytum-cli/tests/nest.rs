@@ -120,6 +120,57 @@ impl Drop for Env {
     }
 }
 
+/// `adytum` with `input` on its stdin: the exit code, stdout and stderr.
+fn piped(home: &std::path::Path, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+    use std::io::Write as _;
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env_clear()
+        .env("ADYTUM_HOME", home)
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary starts");
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    feeder.join().unwrap();
+    (out.status.code().unwrap_or(-1), out.stdout, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A tar of one file, `<dir>/inner/hello.txt`, made on this machine.
+fn small_tar(dir: &std::path::Path) -> Vec<u8> {
+    std::fs::create_dir_all(dir.join("inner")).unwrap();
+    std::fs::write(dir.join("inner/hello.txt"), "through stdin\n").unwrap();
+    let out = Command::new("tar").args(["-c", "-f", "-", "-C"]).arg(dir).arg("inner").env("COPYFILE_DISABLE", "1").output().unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+/// `adytum exec` forwards its stdin and passes the exit code through.
+fn exec_forwards_stdin(home: &std::path::Path, name: &str, folder: &str) {
+    let tar = small_tar(&home.join("stdin-src"));
+    let (code, _, err) = piped(home, &["exec", name, "--", "mkdir", "-p", folder], b"");
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = piped(home, &["exec", name, "--", "tar", "-x", "-f", "-", "-C", folder], &tar);
+    assert_eq!(code, 0, "tar in the cell: {err}");
+    let (code, out, err) = piped(home, &["exec", name, "--", "cat", &format!("{folder}/inner/hello.txt")], b"");
+    assert_eq!((code, String::from_utf8_lossy(&out).into_owned()), (0, "through stdin\n".to_owned()), "{err}");
+    let big: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+    let (code, out, _) = piped(home, &["exec", name, "--", "cat"], &big);
+    assert_eq!((code, out.len()), (0, big.len()));
+    assert!(out == big, "the bytes changed on the way through the stream");
+    let (code, _, err) = piped(home, &["exec", name, "--", "sh", "-c", "cat >/dev/null; echo said >&2; exit 7"], b"ignored");
+    assert_eq!(code, 7, "the command's exit code passes through: {err}");
+    assert!(err.starts_with("said\n"), "{err}");
+}
+
 fn step<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let t = Instant::now();
     let v = f();
@@ -227,6 +278,8 @@ fn containers_in_a_lima_cell_from_create_to_rm() {
     assert_ne!(status(&env.exec(&sealed, &["rm", "-f", "/opt/root.bin"])), 0, "the container's user changed root's copy");
     let (code, v) = env.json(&["cp", files.join("in.bin").to_str().unwrap(), &path("/etc/adytum-test")]);
     assert_eq!((code, v["error"]["code"].as_str()), (1, Some("tool_failed")), "the container's user wrote into /etc: {v}");
+
+    step("exec forwards stdin through a container", || exec_forwards_stdin(&env.home, &sealed, "/tmp/t"));
 
     // Removing the Lima cell removes its containers first, then itself.
     let v = step("rm the Lima cell", || env.ok(&["rm", &vm]));

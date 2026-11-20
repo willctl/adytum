@@ -29,7 +29,7 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         let driver = Arc::new(FakeDriver::new());
         driver.on_exec(|call| if call.argv[0] == "fail" { failed(3, "bad\n") } else { ok(&call.argv.join(" ")) });
-        Rig { ctx: Context { drivers: driver.clone(), home }, driver }
+        Rig { ctx: Context { drivers: driver.clone(), home, input: std::sync::Mutex::new(None) }, driver }
     }
 
     async fn go(&self, line: &str) -> Run {
@@ -150,10 +150,52 @@ async fn exec_passes_arguments_whole_and_reports_the_status() {
     assert_eq!(rig.calls().iter().filter(|c| c.starts_with("exec")).collect::<Vec<_>>(), ["exec adytum-test-a echo $(id) a b"]);
 
     let r = rig.go("exec adytum-test-a -- fail").await;
-    assert_eq!(r.code, 1);
+    assert_eq!(r.code, 3, "the command's own exit code");
     assert_eq!(r.err, "bad\nadytum: the command exited with status 3.\n");
     let r = rig.go("exec adytum-test-a --json -- fail").await;
-    assert_eq!((r.code, r.json()["status"].as_i64()), (1, Some(3)));
+    assert_eq!((r.code, r.json()["status"].as_i64()), (3, Some(3)));
+}
+
+impl Rig {
+    fn give_input(&self, bytes: &[u8]) {
+        *self.ctx.input.lock().unwrap() = Some(Box::new(std::io::Cursor::new(bytes.to_vec())));
+    }
+}
+
+/// A command at the stream's far end that reads all its input, then writes
+/// it back upper-cased and exits with `code`.
+fn shouting(driver: &FakeDriver, code: i32) {
+    driver.on_stream(move |_| {
+        let end = adytum::exec::Output { status: Some(code), stderr: b"done\n".to_vec(), ..adytum::exec::Output::default() };
+        let (ours, mut theirs) = adytum::testing::duplex_ending(end);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut got = Vec::new();
+            theirs.read_to_end(&mut got).await.unwrap();
+            theirs.write_all(&got.to_ascii_uppercase()).await.unwrap();
+        });
+        Ok(ours)
+    });
+}
+
+#[tokio::test]
+async fn input_that_is_not_a_terminal_reaches_the_command_through_a_stream() {
+    let rig = Rig::new("stdin");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    shouting(&rig.driver, 0);
+    rig.give_input(b"tar bytes\n");
+    let r = rig.go("exec adytum-test-a -- tar -x -C /home/cell/t").await;
+    assert_eq!((r.code, r.out.as_str(), r.err.as_str()), (0, "TAR BYTES\n", "done\n"));
+    assert!(rig.calls().last().is_some_and(|c| c == "stream adytum-test-a tar -x -C /home/cell/t"), "{:?}", rig.calls());
+    assert!(rig.calls().iter().all(|c| !c.starts_with("exec")), "{:?}", rig.calls());
+
+    shouting(&rig.driver, 7);
+    rig.give_input(b"x");
+    let r = rig.go("exec adytum-test-a --json -- sh -c 'exit 7'").await;
+    assert_eq!((r.code, r.json()["status"].as_i64(), r.json()["stdout"].as_str()), (7, Some(7), Some("X")));
+    // Taken once: the next command has no input to forward.
+    let r = rig.go("exec adytum-test-a -- id").await;
+    assert_eq!((r.code, r.out.as_str()), (0, "id"));
 }
 
 #[tokio::test]

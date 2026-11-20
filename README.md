@@ -43,7 +43,9 @@ A container cell keeps its parent's wall and is sealed when its parent is. Its i
 
 `--nested-virtualization` on a Lima cell lets programs in it run VMs of their own, on a Mac with an M3 or later chip and macOS 15 or later.
 
-Cell names are `adytum-` and lowercase letters, digits and dashes. Every command takes `--json` and then prints one JSON object; an error is `{"error": {"code", "message", "fix"}}`. The exit code is 0 when it worked, 1 when it was refused or failed, and 2 when the command line was wrong.
+`adytum exec` forwards its stdin to the command when stdin is not a terminal, and shows the command's output as it comes, so `tar -c -f - ./t | adytum exec adytum-web -- tar -x -f - -C /home/cell` unpacks in the cell without a file on the way.
+
+Cell names are `adytum-` and lowercase letters, digits and dashes. Every command takes `--json` and then prints one JSON object; an error is `{"error": {"code", "message", "fix"}}`. The exit code is 0 when it worked, 1 when it was refused or failed, and 2 when the command line was wrong; `adytum exec` exits with the command's own code.
 
 ## The library
 

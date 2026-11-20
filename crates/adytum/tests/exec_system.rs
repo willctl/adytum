@@ -169,3 +169,27 @@ async fn a_failing_command_is_an_output_not_an_error() -> Res {
     assert!(!out.success());
     Ok(())
 }
+
+#[tokio::test]
+async fn a_duplex_gives_stderr_while_the_child_runs_and_finish_leaves_it_out() -> Res {
+    let cmd = Command::new("sh").env("PATH", SAFE_PATH).args(["-c", "echo early >&2; read line; echo \"late $line\" >&2"]);
+    let mut duplex = SystemRunner::new().duplex(&cmd).await?;
+    let mut chunks = duplex.take_stderr().ok_or("a system duplex gives its stderr apart")?;
+    let early = tokio::time::timeout(Duration::from_secs(5), chunks.recv()).await?.ok_or("stderr closed")?;
+    assert_eq!(early, b"early\n", "seen before any input was sent");
+    assert!(duplex.take_stderr().is_none(), "taken once");
+    duplex.write_all(b"x\n").await?;
+    duplex.shutdown().await?;
+    let mut rest = Vec::new();
+    while let Some(chunk) = chunks.recv().await {
+        rest.extend(chunk);
+    }
+    assert_eq!(rest, b"late x\n");
+    let out = duplex.finish().await?;
+    assert!(out.success() && out.stderr.is_empty(), "{out:?}");
+    // Not taken, finish has it.
+    let mut duplex = SystemRunner::new().duplex(&Command::new("sh").env("PATH", SAFE_PATH).args(["-c", "echo kept >&2"])).await?;
+    duplex.shutdown().await?;
+    assert_eq!(duplex.finish().await?.stderr, b"kept\n");
+    Ok(())
+}
