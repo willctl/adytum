@@ -277,7 +277,19 @@ async fn forward(
             let _ = err.flush();
         }
     };
-    let ((), drained, ()) = tokio::join!(feed, drain, show_errors);
+    // The command's output ending is the end, as with ssh: input that never
+    // closes, such as a script's inherited stdin, must not hold it open.
+    let drained = {
+        let work = async { tokio::join!(drain, show_errors).0 };
+        tokio::pin!(feed, work);
+        let mut fed = false;
+        loop {
+            tokio::select! {
+                drained = &mut work => break drained,
+                () = &mut feed, if !fed => fed = true,
+            }
+        }
+    };
     let mut output = from.unsplit(to).finish().await?;
     drained?;
     output.stdout = kept;

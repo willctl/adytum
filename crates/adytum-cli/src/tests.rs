@@ -199,6 +199,23 @@ async fn input_that_is_not_a_terminal_reaches_the_command_through_a_stream() {
 }
 
 #[tokio::test]
+async fn input_that_never_closes_does_not_hold_a_finished_command_open() {
+    let rig = Rig::new("open-stdin");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    rig.driver.on_stream(|_| {
+        let end = adytum::exec::Output { status: Some(0), ..adytum::exec::Output::default() };
+        let (ours, theirs) = adytum::testing::duplex_ending(end);
+        // The command exits at once without reading its input.
+        drop(theirs);
+        Ok(ours)
+    });
+    let (_writer, reader) = tokio::io::duplex(64);
+    *rig.ctx.input.lock().unwrap() = Some(Box::new(reader));
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), rig.go("exec adytum-test-a -- true")).await;
+    assert_eq!(r.expect("exec waited for input that never ends").code, 0);
+}
+
+#[tokio::test]
 async fn cp_works_out_which_side_is_the_cell() {
     let rig = Rig::new("cp");
     assert_eq!(rig.go("create adytum-test-a").await.code, 0);

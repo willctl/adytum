@@ -87,12 +87,23 @@ fn step<T>(label: &str, f: impl FnOnce() -> T) -> T {
     v
 }
 
+/// A child that is killed when the test is done with it, even by a failed
+/// assertion, so no view outlives its test.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The view: on this machine's loopback, the screen share's banner arrives
 /// through the cell's stream, and it stops with the view.
 fn view(env: &Env, cell: &str) {
-    let mut viewer = env.command(BIN).args(["view", cell, "--json"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut viewer = Reaped(env.command(BIN).args(["view", cell, "--json"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
     let mut first = String::new();
-    BufReader::new(viewer.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    BufReader::new(viewer.0.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let opened: Value = serde_json::from_str(first.trim()).unwrap_or_else(|e| panic!("{e}: {first}"));
     let address: std::net::SocketAddr = opened["address"].as_str().unwrap().parse().unwrap();
     assert!(address.ip().is_loopback(), "{opened}");
@@ -108,8 +119,8 @@ fn view(env: &Env, cell: &str) {
         "the screen share listens beyond the guest's loopback: {listening}"
     );
     drop(socket);
-    Command::new("kill").args(["-INT", &viewer.id().to_string()]).status().unwrap();
-    assert!(viewer.wait().unwrap().success(), "the view did not close cleanly");
+    Command::new("kill").args(["-INT", &viewer.0.id().to_string()]).status().unwrap();
+    assert!(viewer.0.wait().unwrap().success(), "the view did not close cleanly");
     let (_, state, _) = env.adytum(&["exec", "--root", cell, "--", "systemctl", "is-active", "adytum-vnc.service"]);
     assert_ne!(state.trim(), "active", "the screen share outlived the view");
     let (code, _, _) = env.adytum(&["exec", "--root", cell, "--", "test", "-e", "/run/adytum/vnc/pass"]);
@@ -118,7 +129,7 @@ fn view(env: &Env, cell: &str) {
 
 /// A stdio MCP client: one JSON-RPC message per line each way.
 struct Mcp {
-    child: Child,
+    child: Reaped,
     input: std::process::ChildStdin,
     lines: mpsc::Receiver<String>,
     next: u64,
@@ -144,7 +155,7 @@ impl Mcp {
                 }
             }
         });
-        Mcp { child, input, lines, next: 1 }
+        Mcp { child: Reaped(child), input, lines, next: 1 }
     }
 
     fn send(&mut self, message: &Value) {
@@ -226,7 +237,7 @@ fn the_firefox_recipe_is_driven_by_mcp_over_the_cell_stream_and_the_desktop_is_v
         let snapshot = mcp.call("tools/call", json!({ "name": "take_snapshot", "arguments": {} }));
         assert!(snapshot.to_string().contains("Behind the wall"), "{snapshot}");
         drop(mcp.input);
-        let _ = mcp.child.wait();
+        let _ = mcp.child.0.wait();
     });
 
     env.ok(&["rm", &cell]);
