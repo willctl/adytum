@@ -105,17 +105,68 @@ pub(crate) const READY: &str = "/run/adytum/ready";
 /// from the pinned archive and checked against its sha256 before anything
 /// is unpacked, then the ready file. A failed step ends the script before
 /// the ready file.
-pub(crate) fn boot_script(gvisor: Option<&crate::lima::GvisorPin>) -> String {
+pub(crate) fn boot_script(gvisor: Option<&crate::lima::GvisorPin>, desktop: bool) -> String {
     let mut script = provision_script();
     if let Some(pin) = gvisor {
         let hex = pin.digest.strip_prefix("sha256:").unwrap_or(&pin.digest);
         script.push_str(&GVISOR.replace("@VERSION@", &pin.version).replace("@URL@", &pin.location).replace("@SHA256@", hex));
+    }
+    if desktop {
+        script.push_str(&DESKTOP.replace("@USER@", EXEC_USER).replace("@DISPLAY@", DISPLAY).replace("@VNC@", &VNC_PORT.to_string()).replace("@PASS@", VNC_PASSWORD));
     }
     script.push_str("\n# The cell is ready only if every step above held.\ninstall -d -m 0755 /run/adytum\ntouch ");
     script.push_str(READY);
     script.push('\n');
     script
 }
+
+/// The display a desktop cell's programs draw on: give them `DISPLAY=:99`.
+pub const DISPLAY: &str = ":99";
+/// Where the desktop's screen share listens, on the guest's loopback only.
+pub const VNC_PORT: u16 = 5900;
+pub(crate) const VNC_PASSWORD: &str = "/run/adytum/vnc/pass";
+pub(crate) const VNC_UNIT: &str = "adytum-vnc.service";
+
+/// A display for the cell's user, always on, and a screen share started
+/// only while someone views it, with a password made for that one view.
+/// Neither listens beyond the guest's loopback.
+const DESKTOP: &str = r#"
+# A desktop: a virtual display, and a screen share on the guest's loopback.
+marker=/usr/local/lib/adytum/desktop
+if [ ! -e "$marker" ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends xvfb x11vnc socat
+  install -d -m 0755 /usr/local/lib/adytum
+  touch "$marker"
+fi
+cat > /etc/systemd/system/adytum-display.service <<'UNIT'
+[Unit]
+Description=Adytum desktop, the display
+
+[Service]
+User=@USER@
+Group=@USER@
+ExecStart=/usr/bin/Xvfb @DISPLAY@ -screen 0 1280x800x24 -nolisten tcp
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+cat > /etc/systemd/system/adytum-vnc.service <<'UNIT'
+[Unit]
+Description=Adytum desktop, the screen share on 127.0.0.1
+Requires=adytum-display.service
+After=adytum-display.service
+
+[Service]
+User=@USER@
+Group=@USER@
+ExecStart=/usr/bin/x11vnc -display @DISPLAY@ -localhost -rfbport @VNC@ -passwdfile @PASS@ -forever -shared -noxdamage -quiet
+Restart=on-failure
+UNIT
+systemctl daemon-reload
+systemctl enable --now adytum-display.service >/dev/null 2>&1
+"#;
 
 const GVISOR: &str = r#"
 # gVisor, so a container gets a kernel of its own.
@@ -153,7 +204,7 @@ mod tests {
     #[test]
     fn the_scripts_are_valid_shell() {
         let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
-        for script in [boot_script(None), boot_script(Some(&pin))] {
+        for script in [boot_script(None, false), boot_script(Some(&pin), true)] {
             let mut sh = std::process::Command::new("sh").arg("-n").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
             std::io::Write::write_all(&mut sh.stdin.take().unwrap(), script.as_bytes()).unwrap();
             let out = sh.wait_with_output().unwrap();
@@ -164,20 +215,32 @@ mod tests {
     #[test]
     fn gvisor_is_checked_against_its_pin_before_it_is_unpacked_and_installed_once() {
         let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
-        let script = boot_script(Some(&pin));
+        let script = boot_script(Some(&pin), false);
         let hex = pin.digest.strip_prefix("sha256:").unwrap();
         assert!(script.contains(&format!("echo \"{hex}  $dir/gvisor.tar.zstd\" | sha256sum -c --quiet -")), "{script}");
         assert!(script.contains(&pin.location) && script.contains(&format!("gvisor-{}", pin.version)));
         assert!(at(&script, "sha256sum -c") < at(&script, "tar -x"), "nothing is unpacked before the check");
         assert!(at(&script, "if [ ! -e \"$marker\" ]") < at(&script, "curl"));
         assert!(at(&script, "nft -f /etc/adytum/firewall.nft") < at(&script, "curl"), "the firewall comes first");
-        assert!(!boot_script(None).contains("gvisor"));
+        assert!(!boot_script(None, false).contains("gvisor"));
+    }
+
+    #[test]
+    fn a_desktop_listens_on_the_guests_loopback_only_and_shares_its_screen_only_when_asked() {
+        let script = boot_script(None, true);
+        assert!(script.contains("Xvfb :99 -screen 0 1280x800x24 -nolisten tcp"), "{script}");
+        assert!(script.contains("x11vnc -display :99 -localhost -rfbport 5900 -passwdfile /run/adytum/vnc/pass"), "{script}");
+        assert!(script.contains("User=cell"), "the cell's user draws on it, not root");
+        assert!(script.contains("systemctl enable --now adytum-display.service"));
+        assert!(!script.contains("enable --now adytum-vnc"), "the screen share starts only for a view");
+        assert!(at(&script, "table inet adytum") < at(&script, "apt-get"), "the firewall comes first");
+        assert!(!boot_script(None, false).contains("Xvfb"));
     }
 
     #[test]
     fn the_ready_file_is_the_last_step_of_a_script_that_stops_at_the_first_failure() {
         let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
-        for script in [boot_script(None), boot_script(Some(&pin))] {
+        for script in [boot_script(None, false), boot_script(Some(&pin), true)] {
             assert!(script.starts_with("#!/bin/sh\n# Written by adytum. Runs as root at every boot.\nset -eu\n"), "{script}");
             assert!(script.trim_end().ends_with(&format!("touch {READY}")), "{script}");
             assert_eq!(script.matches("#!/bin/sh").count(), 1);

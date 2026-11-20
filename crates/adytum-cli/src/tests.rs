@@ -425,3 +425,18 @@ async fn a_host_that_cannot_list_is_said_and_the_command_still_runs() {
     assert!(r.err.contains("could not list the Lima cells on this machine"), "{}", r.err);
     assert_eq!(r.json()["cells"][0]["name"], "adytum-test-a", "left as recorded");
 }
+
+#[tokio::test]
+async fn exec_runs_as_root_only_when_asked_and_desktop_is_for_lima() {
+    let rig = Rig::new("root");
+    assert_eq!(rig.go("create adytum-test-a --desktop").await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-a".parse().unwrap()).unwrap();
+    assert!(matches!(spec.kind, adytum::Kind::Lima(ref o) if o.desktop));
+    assert_eq!(rig.go("exec --root adytum-test-a -- id").await.code, 0);
+    assert_eq!(rig.go("exec adytum-test-a -- id").await.code, 0);
+    let execs: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("exec")).collect();
+    assert_eq!(execs, ["exec adytum-test-a (root) id", "exec adytum-test-a id"]);
+    let r = rig.go(&format!("create adytum-test-c --kind container --image {IMAGE} --desktop --json")).await;
+    assert_eq!(r.code, 2);
+    assert_eq!(rig.go("exec --sealed adytum-test-a -- id").await.code, 2);
+}

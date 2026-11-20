@@ -39,9 +39,13 @@ adytum ls                                # adytum-job is indented under adytum-b
 adytum rm adytum-box                     # removes adytum-job first
 ```
 
-A container cell keeps its parent's wall, is sealed when its parent is, and gets its parent's CPUs and memory unless given less. Its image is pinned by digest. It runs as user 1000 with every capability dropped and no way to gain one, and a sealed one has no network. It publishes no ports and mounts nothing. Without `--parent` a container cell runs through `docker` on this machine.
+A container cell keeps its parent's wall, is sealed when its parent is, and gets its parent's CPUs and memory unless given less. Its image is pinned by digest. It runs under gVisor, which gives it a kernel of its own, as user 1000 with every capability dropped and no way to gain one, and a sealed one has no network. It publishes no ports and mounts nothing. `--runtime runc` runs an open container on its parent's kernel instead. Without `--parent` a container cell runs through `docker` on this machine, and must be sealed, since a network there reaches this machine.
 
 `--nested-virtualization` on a Lima cell lets programs in it run VMs of their own, on a Mac with an M3 or later chip and macOS 15 or later.
+
+`--desktop` on a Lima cell gives its user a display at `DISPLAY=:99`. `adytum view <cell>` shows it: it prints a `vnc://127.0.0.1:<port>` address and a password for that view alone, carries each connection through the cell's stream, and stops the screen share on Ctrl-C. Nothing listens beyond the loopback of either machine. [The Firefox recipe](docs/recipes/firefox.md) uses a desktop cell, with Firefox driven by an MCP server inside the cell over `adytum exec`.
+
+`adytum exec --root` runs a command as root, for provisioning.
 
 `adytum exec` forwards its stdin to the command when stdin is not a terminal, and shows the command's output as it comes, so `tar -c -f - ./t | adytum exec adytum-web -- tar -x -f - -C /home/cell` unpacks in the cell without a file on the way.
 
@@ -89,7 +93,7 @@ async fn main() -> adytum::Result<()> {
 ## Limits
 
 - Lima cells use the `vz` VM type, so the host is a Mac. A Lima cell cannot run inside another cell yet, and there is no UTM, Windows Sandbox or Hyper-V driver; [the design](docs/design.md#kinds-to-come) says what each would take.
-- A VM is a strong wall, not a perfect one: a flaw in the hypervisor reaches the host. A container is a weaker wall than a VM: a flaw in the guest's kernel gives root in the parent VM, and root there can lift the parent's firewall and reach the host's loopback.
+- A VM is a strong wall, not a perfect one: a flaw in the hypervisor reaches the host. A container is a weaker wall than a VM: a flaw in gVisor, or in the parent's kernel for a container under runc, gives root in the parent VM, and root there can lift the parent's firewall and reach the host's loopback.
 - A wall is a label. Adytum keeps walls apart and never learns what one means, so who may use a wall is decided by whatever drives Adytum.
 - Adytum acts for the person who runs it. Anyone who can run commands as you can run `adytum` as you.
 - A cell has no IPv6 and reaches the internet, unless it is a sealed container, which has no network. The firewall closes the host and private networks, not the internet.

@@ -70,7 +70,9 @@ async fn run(tokens: &[String], ctx: &Context, out: &mut dyn Write, err: &mut dy
     match commands::execute(parsed.command, ctx, out, err, parsed.json).await {
         Ok(done) => {
             if parsed.json {
-                write_line(out, &done.json.to_string());
+                if !done.json.is_null() {
+                    write_line(out, &done.json.to_string());
+                }
             } else if !done.text.is_empty() {
                 write_line(out, &done.text);
             }

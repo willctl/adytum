@@ -2,8 +2,11 @@ mod guest;
 mod network;
 mod pins;
 mod template;
+mod view;
 
+pub use guest::{DISPLAY, VNC_PORT};
 pub use pins::{gvisor, image, image_names, GvisorPin, DEFAULT_IMAGE};
+pub use view::{stream_argv, View, SECRET_LEN};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

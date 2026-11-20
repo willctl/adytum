@@ -177,7 +177,7 @@ fn script(options: &LimaOptions) -> Result<String, Error> {
     } else {
         None
     };
-    Ok(boot_script(pin.as_ref()))
+    Ok(boot_script(pin.as_ref(), options.desktop))
 }
 
 /// Made from the cell's own wall, so a cell only ever joins its wall's network.

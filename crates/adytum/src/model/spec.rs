@@ -55,11 +55,15 @@ pub struct LimaOptions {
     /// later chip.
     #[serde(default)]
     pub nested_virtualization: bool,
+    /// A virtual display for the cell's user, and a screen share on the
+    /// guest's loopback that `adytum view` opens one session at a time.
+    #[serde(default)]
+    pub desktop: bool,
 }
 
 impl LimaOptions {
     pub fn new(image: ImagePin) -> LimaOptions {
-        LimaOptions { image, containers: false, nested_virtualization: false }
+        LimaOptions { image, containers: false, nested_virtualization: false, desktop: false }
     }
 }
 

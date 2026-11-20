@@ -8,7 +8,8 @@
         "arch": "aarch64"
       },
       "containers": true,
-      "nested_virtualization": false
+      "nested_virtualization": false,
+      "desktop": false
     }
   },
   "parent": null,

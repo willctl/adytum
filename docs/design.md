@@ -41,9 +41,13 @@ The rules for a cell with a parent, each with its own refusal code:
 - The child asks for no more CPUs or memory than its parent has, and a VM child no more disk (`child_too_big`). Each child is held to this alone: they are limits, not reservations, so cells in one parent can ask for its whole size each.
 - A nested cell publishes no ports (`nested_port`) and mounts nothing from this machine (`nested_mount`): its ports would open inside the parent, and its mounts would come from the parent, where no rule here can see them.
 - At most three cells stand between this machine and a cell (`too_deep`).
-- A clone is made where its source runs (`clone_host`).
+- A clone is made where its source runs (`clone_host`), from a recorded cell (`clone_source_missing`) that holds no cells (`clone_has_cells`), so a copy never carries a VM's containers unrecorded.
 
-`Cells` keeps the tree in order. Creating or starting a cell starts the cells it runs in first, outermost first. Stopping a cell stops the running cells inside it first, deepest first. Removing a cell removes the cells inside it first, deepest first, each with its own intent and settlement in the ledger. A cell whose host is not running cannot be asked, so it is not removed through a driver; it goes with the cell it runs in, because removing a VM removes its containers.
+Two rules hold for a container wherever it runs. A sealed container runs under gVisor (`runc_sealed`). A container on this machine is sealed (`open_container_here`): docker's bridge, and Docker Desktop's `host.docker.internal`, reach this machine's loopback and LAN, and no firewall of Adytum's stands in between.
+
+Every rule runs again inside the ledger's write that records a create, against the parent's `CellId` as the caller saw it, so a parent removed and made again while it started cannot adopt the child.
+
+`Cells` keeps the tree in order. Creating or starting a cell starts the cells it runs in first, outermost first. Stopping and removing first ask each host involved for its cells' states, so neither acts on a state the ledger kept from before. Stopping a cell stops the running cells inside it first, deepest first. Removing a cell inside a stopped one starts that one first, so the cell's own driver removes it. Removing a cell removes the cells inside it first, deepest first, each with its own intent and settlement in the ledger; one whose host is not running goes with the cell it runs in, because removing a VM removes its containers.
 
 ## The host is closed
 
@@ -55,17 +59,31 @@ Lima's user-mode network maps the guest address 192.168.5.2 (`host.lima.internal
 4. Accept the subnets the cell is on, such as a named network's peers. The host's address was dropped in step 3, so this cannot reopen it.
 5. Drop the private ranges 10/8, 172.16/12, 192.168/16, 169.254/16 and 100.64/10, which hold the host's LAN address.
 
-The chain hangs on both the output and the forward hook, so a container inside a cell meets it too. The forward hook first accepts packets of connections conntrack already knows, so the replies to a container's connections reach it; every new connection a container opens is forwarded new, and meets the rules above. Without `nft` in the image the script fails and the cell does not start. The internet stays open, because a cell installs software after it is made.
+The chain hangs on both the output and the forward hook, so a container inside a cell meets it too. The forward hook first accepts packets of connections conntrack already knows, so the replies to a container's connections reach it; every new connection a container opens is forwarded new, and meets the rules above. The internet stays open, because a cell installs software after it is made.
+
+## The boot script
+
+Lima runs one script of Adytum's as root at every boot: the firewall above, then gVisor for a cell that holds containers, then the desktop for a cell that has one, then a ready file in `/run/adytum`. It stops at the first step that fails. Lima reports a start as done even when its boot script failed, so the Lima driver looks for the ready file after every start, and stops a cell without one again, with the end of its boot log as the error. Without `nft` in the image, so, the cell does not start.
 
 ## Containers
 
-A Lima cell made with `containers` on runs rootful containerd and nerdctl from the archive Lima 2.1.2 pins by digest; the rootless one Lima starts by default stays off. The container driver speaks docker's command line, so `nerdctl` in a Lima cell and `docker` on this machine both work. Its image is pinned by digest (`OciImage`), because a tag can move.
+A Lima cell made with `containers` on runs rootful containerd and nerdctl from the archive Lima 2.1.2 pins by digest; the rootless one Lima starts by default stays off. Its boot script installs gVisor's `runsc` and containerd shim once, from the release archive pinned by version and sha256 in `pins.json`, checked before anything is unpacked. The container driver speaks docker's command line, so `nerdctl` in a Lima cell and `docker` on this machine both work. Its image is pinned by digest (`OciImage`), because a tag can move.
 
-Every container runs `sleep infinity` under an init, as user 1000:1000, with `--cap-drop ALL`, `--security-opt no-new-privileges` and a pids limit. A sealed one gets `--network none`: only a loopback interface, so it reaches neither this machine nor its parent's network. An open one is on nerdctl's bridge inside its parent, behind the parent's firewall. `ExecOpts { root: true, .. }` runs as uid 0, still with no capabilities.
+Every container runs `sleep infinity` under an init, under gVisor (`--runtime io.containerd.runsc.v1`, systrap, gVisor's default platform) unless its options say runc, as user 1000:1000, with `--cap-drop ALL`, `--security-opt no-new-privileges`, a pids limit and no log of nerdctl's. A sealed one gets `--network none`, so it reaches neither this machine nor its parent's network. An open one is on nerdctl's bridge inside its parent, behind the parent's firewall. No container publishes a port. `ExecOpts { root: true, .. }` runs as uid 0, still with no capabilities.
+
+A container carries the ledger's `CellId` as the label `adytum.cell`, and its wall as `adytum.wall`. The driver lists only containers that carry an id, and removes a container only when it carries the id the ledger recorded: a container that took the name since is someone else's and is left alone. A name taken while the image was pulled is a `name_taken` refusal, never a cleanup. Whether a container exists is read from `ps` alone, never from what a command printed, and only the cell's own driver can count it removed: a host that cannot be reached is an error.
 
 Copies never use `nerdctl cp`, which nerdctl documents as meant only for trusted containers: it runs as root in the parent and follows what the container's file system says. A copy in runs `mkdir`, `tar` or `dd` inside the container as the copy's owner, fed through `exec`, so it lands only where that user may write, under the container's umask. A copy out runs `tar` or `cat` inside as user 1000, so it gets only what that user may read, and this machine's tar unpacks it, refusing entries that climb out of the destination. An image needs `sleep`, and for copies `tar`, `dd`, `cat` and `test`, which busybox and the common base images have.
 
-A container is a weaker wall than a VM. A flaw in the guest kernel or in runc gives a program root in the parent VM, and root there can lift the parent's firewall. The VM's own wall, the hypervisor, still stands between it and the host's memory and files.
+A container is a weaker wall than a VM. Under gVisor a program's system calls meet gVisor's own kernel in user space, so a flaw in the parent's kernel is not one step away; a flaw in gVisor, or in the parent's kernel under runc, gives root in the parent VM, and root there can lift the parent's firewall. The VM's own wall, the hypervisor, still stands between it and the host's memory and files.
+
+## Desktops and views
+
+A Lima cell made with `desktop` on runs Xvfb as the cell's user at `DISPLAY=:99`, listening on no TCP port, and has an x11vnc unit that listens on the guest's loopback at port 5900. `lima::View` (the command's `adytum view`) writes a new eight-character password through stdin as the cell's user, starts the screen share, and listens on this machine's 127.0.0.1 on a port of its own. It carries each connection through the cell's stream (`socat` to the guest's loopback), so no port is forwarded. Closing the view stops the screen share and removes the password. VNC's own authentication is weak, so both ends are loopback only and the password lives for one view.
+
+## Limits on what is carried
+
+`Runner::run` keeps at most 64 MiB of each output stream and stops a command that writes more. A copy out of a cell stops past 8 GiB; the Lima driver also refuses a FIFO, socket or device before copying, since `limactl copy` follows links and reads to the end. Streams, such as `adytum exec` with stdin that is not a terminal, carry what comes without holding it.
 
 ## The guest guard
 
@@ -93,7 +111,8 @@ Writes are `BEGIN IMMEDIATE` transactions with `synchronous = FULL`, so a record
 - Under load, Lima's host agent can miss its 5-second start-up window. The driver force-stops the instance and starts it once more; a second miss is a tool failure.
 - Lima keeps unix sockets in each instance's folder, and a socket path on macOS holds 104 bytes, so a long `ADYTUM_HOME` is refused and `adytum doctor` warns about it.
 - Lima does not refuse two networks with one gateway, so the driver picks a gateway no other network holds.
-- nerdctl ends a failed command's stderr with a line of its own, and the container driver takes it off.
+- nerdctl exits 1 for any failed `exec` and ends its stderr with a line that holds the command's own code; the container driver takes the line off and passes the code on, for a stream too.
+- gVisor's shim cannot write nerdctl's own log, so containers run with `--log-driver none`.
 
 ## How it is checked
 
@@ -101,7 +120,10 @@ The rules each have a refusal test. The drivers are tested against a fake runner
 
 - `crates/adytum-cli/tests/live.rs` runs real VMs from create to remove, including a `kill -9` during a create.
 - `crates/adytum-cli/tests/firewall.rs` proves the host is closed: listeners on the host's loopback and LAN address are unreachable, `sudo` fails, the rules hold after a restart, and DNS still works.
-- `crates/adytum-cli/tests/nest.rs` runs containers in a Lima cell: a sealed one has no network and reaches neither the host's loopback nor `host.lima.internal`, an open one reaches the internet and not the host, copies keep their bytes and owners, removing the VM removes its containers first, and a create killed during the image pull leaves no container after a reconcile.
+- `crates/adytum-cli/tests/nest.rs` runs containers in a Lima cell: both run under gVisor, a sealed one has no network and reaches neither the host's loopback nor `host.lima.internal`, an open one reaches the internet and not the host, copies keep their bytes and owners, `adytum exec` forwards stdin and passes the exit code through, removing the VM removes its containers first, and a create killed during the image pull leaves no container after a reconcile.
+- `crates/adytum-cli/tests/desktop.rs` runs [the Firefox recipe](recipes/firefox.md), views the desktop through the stream, and has the MCP server in the cell navigate to a page served in the cell and take a snapshot, over `adytum exec`.
+
+`crates/adytum/tests/boundaries.rs` holds the checks a review of the boundaries asked for: a command's output is never read as a cell gone, a container is removed only when it is provably the one made, and a parent swapped while it starts adopts nothing.
 
 ## Kinds to come
 
@@ -115,7 +137,7 @@ What other kinds would need from the design, so the design keeps room for them. 
 
 - Lima 2.3's `networkOpts.hostLoopback: false` and `--sync`, which could replace the in-guest firewall. They need an upgrade from Lima 2.1.2.
 - An egress proxy on the host, so a cell has no network card and reaches only what the host lets through.
-- Rootless containerd in a Lima cell, which would keep a container escape from root in the VM.
+- Rootless containerd in a Lima cell, which would keep a gVisor escape from root in the VM.
 - Named networks for containers, and container images built rather than pulled.
 - A microsandbox (libkrun) driver and an Apple container driver.
-- OCI containers under runsc or kata.
+- Containers under kata.

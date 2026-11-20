@@ -29,6 +29,7 @@ pub struct CreateArgs {
     pub sealed: bool,
     pub containers: bool,
     pub nested_virtualization: bool,
+    pub desktop: bool,
     pub wall: Option<String>,
     pub cpus: Option<u8>,
     pub memory_mib: Option<u32>,
@@ -47,7 +48,8 @@ pub enum Command {
     Rm(String),
     Clone { from: String, to: String, wall: Option<String>, ports: Vec<(u16, u16)> },
     Doctor,
-    Exec { name: String, argv: Vec<String> },
+    Exec { name: String, argv: Vec<String>, root: bool },
+    View(String),
     Cp { src: String, dst: String, owner: Option<String> },
     Ls,
 }
@@ -64,9 +66,10 @@ adytum: cells on this machine
 Usage:
   adytum create <name> [--sealed] [--wall wall_x] [--cpus N] [--memory MiB]
                        [--image ubuntu-24.04] [--port host:guest]...
-                       [--containers] [--nested-virtualization]
+                       [--containers] [--nested-virtualization] [--desktop]
                                          (a Lima VM; --containers lets it hold
-                                          container cells)
+                                          container cells, --desktop gives it
+                                          a display at DISPLAY=:99)
   adytum create <name> --kind container --image <ref>@sha256:<digest>
                        [--parent <cell>] [--sealed] [--cpus N] [--memory MiB]
                        [--runtime gvisor|runc]
@@ -81,13 +84,16 @@ Usage:
   adytum clone <from> <to> [--wall wall_x] [--port host:guest]...
                                          (<from> must be stopped; the copy
                                           keeps its wall unless you give one)
-  adytum exec <name> -- <command> [args...]
+  adytum exec [--root] <name> -- <command> [args...]
                                          (stdin that is not a terminal goes to
                                           the command; exits with its code)
   adytum cp [--owner user] <source> <destination>
                                          (one side is <name>:<absolute path>;
                                           --owner writes a copy into a cell
                                           as that guest user, such as root)
+  adytum view <name>                     (a desktop cell's screen on this machine's
+                                          127.0.0.1 with a password for this view;
+                                          until Ctrl-C)
   adytum ls                              (cells inside a cell are indented under it)
   adytum doctor                          (what is wrong with the setup; exit 1 on a failure)
   adytum --version
@@ -100,7 +106,7 @@ Cells are named adytum-<lowercase letters, digits, dashes>.
 ";
 
 const VALUE_FLAGS: [&str; 9] = ["wall", "cpus", "memory", "image", "port", "owner", "kind", "parent", "runtime"];
-const SWITCHES: [&str; 3] = ["sealed", "containers", "nested-virtualization"];
+const SWITCHES: [&str; 5] = ["sealed", "containers", "nested-virtualization", "desktop", "root"];
 
 #[derive(Default)]
 struct Raw {
@@ -204,6 +210,7 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
                 sealed: has("sealed"),
                 containers: has("containers"),
                 nested_virtualization: has("nested-virtualization"),
+                desktop: has("desktop"),
                 ..CreateArgs::default()
             };
             for (flag, value) in &raw.values {
@@ -256,12 +263,13 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
             Command::Doctor
         }
         "exec" => {
-            if !raw.switches.is_empty() || !raw.values.is_empty() {
-                return Err(Usage::new("`adytum exec` does not take that option.", "Write adytum exec <name> -- <command> [args...]."));
+            if raw.switches.iter().any(|s| s != "root") || !raw.values.is_empty() {
+                return Err(Usage::new("`adytum exec` does not take that option.", "Write adytum exec [--root] <name> -- <command> [args...]."));
             }
             let name = one_name("exec", &raw)?;
+            let root = !raw.switches.is_empty();
             match raw.rest {
-                Some(argv) if !argv.is_empty() => Command::Exec { name, argv },
+                Some(argv) if !argv.is_empty() => Command::Exec { name, argv, root },
                 _ => return Err(Usage::new("`adytum exec` needs a command after --.", "Write adytum exec <name> -- <command> [args...].")),
             }
         }
@@ -275,6 +283,10 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
                 [src, dst] => Command::Cp { src: src.clone(), dst: dst.clone(), owner },
                 _ => return Err(Usage::new("`adytum cp` needs a source and a destination.", "Write adytum cp <source> <destination>, one of them <name>:<absolute path>.")),
             }
+        }
+        "view" => {
+            only_json("view", &raw)?;
+            Command::View(one_name("view", &raw)?)
         }
         "ls" => {
             only_json("ls", &raw)?;
@@ -319,7 +331,7 @@ mod tests {
         let tokens: Vec<String> = ["exec", "adytum-a", "--json", "--", "echo", "--json", "$(x)", "a b"].iter().map(|s| (*s).to_owned()).collect();
         let parsed = parse(&tokens).unwrap();
         assert!(parsed.json);
-        assert_eq!(parsed.command, Command::Exec { name: "adytum-a".into(), argv: vec!["echo".into(), "--json".into(), "$(x)".into(), "a b".into()] });
+        assert_eq!(parsed.command, Command::Exec { name: "adytum-a".into(), argv: vec!["echo".into(), "--json".into(), "$(x)".into(), "a b".into()], root: false });
         // --json after the dashes belongs to the command, not to adytum.
         assert!(!wants_json(&["exec".into(), "a".into(), "--".into(), "--json".into()]));
     }

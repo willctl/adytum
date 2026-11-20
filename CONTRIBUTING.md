@@ -20,6 +20,7 @@ The live tests need Lima and the internet, and make real VMs, so they run only w
 ADYTUM_LIVE=1 cargo test -p adytum-cli --test live -- --nocapture --test-threads=1
 ADYTUM_LIVE=1 cargo test -p adytum-cli --test firewall -- --nocapture --test-threads=1
 ADYTUM_LIVE=1 cargo test -p adytum-cli --test nest -- --nocapture --test-threads=1
+ADYTUM_LIVE=1 cargo test -p adytum-cli --test desktop -- --nocapture --test-threads=1
 ```
 
 ## Rules

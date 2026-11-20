@@ -79,7 +79,8 @@ pub(crate) async fn execute(command: Command, ctx: &Context, out: &mut dyn Write
             let wall = wall.map(|w| w.parse::<Wall>().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))).transpose()?;
             clone(ctx, err, &from, to, wall, &ports).await
         }
-        Command::Exec { name, argv } => exec(ctx, &name, &argv, out, err, json).await,
+        Command::Exec { name, argv, root } => exec(ctx, &name, &argv, root, out, err, json).await,
+        Command::View(name) => view(ctx, &name, out, err, json).await,
         Command::Cp { src, dst, owner } => copy(ctx, err, &src, &dst, owner.as_deref()).await,
         Command::Ls => list(ctx, err).await,
     }
@@ -105,7 +106,7 @@ fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result
             let image_name = args.image.as_deref().unwrap_or(adytum::lima::DEFAULT_IMAGE);
             let image = adytum::lima::image(image_name)
                 .ok_or_else(|| usage(format!("There is no image named {image_name:?}."), format!("Use one of: {}.", adytum::lima::image_names().join(", "))))?;
-            Kind::Lima(LimaOptions { image, containers: args.containers, nested_virtualization: args.nested_virtualization })
+            Kind::Lima(LimaOptions { image, containers: args.containers, nested_virtualization: args.nested_virtualization, desktop: args.desktop })
         }
         "container" => {
             if args.containers {
@@ -113,6 +114,9 @@ fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result
             }
             if args.nested_virtualization {
                 return Err(lima_only("nested-virtualization"));
+            }
+            if args.desktop {
+                return Err(lima_only("desktop"));
             }
             let text = args.image.as_deref().ok_or_else(|| usage("A container cell needs an image.", "Give --image <reference>@sha256:<digest>."))?;
             let image: OciImage =
@@ -199,14 +203,14 @@ async fn clone(ctx: &Context, err: &mut dyn Write, from: &CellName, to: CellName
 /// Input that is not a terminal is forwarded to the command through a
 /// stream, and its output is written as it comes. The exit code is the
 /// command's own, or 1 when it did not exit by itself.
-async fn exec(ctx: &Context, name: &str, argv: &[String], out: &mut dyn Write, err: &mut dyn Write, json: bool) -> Result<Done, Failure> {
+async fn exec(ctx: &Context, name: &str, argv: &[String], root: bool, out: &mut dyn Write, err: &mut dyn Write, json: bool) -> Result<Done, Failure> {
     let name = name.parse::<CellName>()?;
     let session = Session::open(ctx, err).await?;
     let driver = session.cells.driver_of(&name)?;
     let input = ctx.input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     let output = match input {
-        Some(input) => forward(&*driver, &name, argv, input, if json { None } else { Some((&mut *out, &mut *err)) }).await?,
-        None => driver.exec(&name, argv, ExecOpts::default()).await?,
+        Some(input) => forward(&*driver, &name, argv, root, input, if json { None } else { Some((&mut *out, &mut *err)) }).await?,
+        None => driver.exec(&name, argv, ExecOpts { root, ..ExecOpts::default() }).await?,
     };
     let exit = match (output.success(), output.status) {
         (true, _) => 0,
@@ -235,11 +239,12 @@ async fn forward(
     driver: &dyn adytum::Driver,
     name: &CellName,
     argv: &[String],
+    root: bool,
     mut input: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     shown: Option<(&mut dyn Write, &mut dyn Write)>,
 ) -> Result<adytum::exec::Output, Failure> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut duplex = driver.stream(name, argv, ExecOpts::default()).await?;
+    let mut duplex = driver.stream(name, argv, ExecOpts { root, ..ExecOpts::default() }).await?;
     let (mut out, mut err) = shown.map_or((None, None), |(o, e)| (Some(o), Some(e)));
     let mut errors = if err.is_some() { duplex.take_stderr() } else { None };
     let (mut from, mut to) = tokio::io::split(duplex);
@@ -277,6 +282,37 @@ async fn forward(
     drained?;
     output.stdout = kept;
     Ok(output)
+}
+
+/// Prints where to connect and the password, then carries connections until
+/// interrupted. With `--json` the one object comes first, so a script can
+/// read it while the view runs.
+async fn view(ctx: &Context, name: &str, out: &mut dyn Write, err: &mut dyn Write, json: bool) -> Result<Done, Failure> {
+    let name = name.parse::<CellName>()?;
+    let session = Session::open(ctx, err).await?;
+    let view = adytum::lima::View::open(session.cells.driver_of(&name)?, name.clone()).await?;
+    let opened = json!({ "name": name, "url": view.url(), "address": view.address().to_string(), "secret": view.secret() });
+    let line = if json { opened.to_string() } else { format!("{name}: {} (password {}); Ctrl-C to close", view.url(), view.secret()) };
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+    until_interrupted().await;
+    view.close().await?;
+    Ok(Done { json: Value::Null, text: String::new(), exit: 0 })
+}
+
+async fn until_interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// `<name>:<path>` is a path inside a cell; anything else is on the host.
