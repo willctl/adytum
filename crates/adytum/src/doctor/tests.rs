@@ -9,6 +9,8 @@ fn fine() -> Machine {
         lima_home_exists: true,
         image_cached: true,
         free_bytes: Some(200 * GIB),
+        chip: Some("Apple M3 Max".to_owned()),
+        macos: Some("26.5".to_owned()),
         ledger: LedgerStatus::Open { unsettled: 0 },
     }
 }
@@ -72,6 +74,21 @@ fn a_ledger_to_set_up_again_fails_and_unsettled_operations_warn() {
     assert!(is_warn(&get(&m, "ledger-settled")));
     assert_eq!(get(&m, "ledger").verdict, Verdict::Ok);
     assert_eq!(get(&Machine { ledger: LedgerStatus::Missing, ..fine() }, "ledger").verdict, Verdict::Ok);
+}
+
+#[test]
+fn nested_virtualization_is_reported_for_m3_and_later_on_macos_15_and_later() {
+    let can = |chip: &str, macos: &str| get(&Machine { chip: Some(chip.to_owned()), macos: Some(macos.to_owned()), ..fine() }, "nested-virtualization");
+    for (chip, macos) in [("Apple M3", "15.0"), ("Apple M3 Max", "26.5.2"), ("Apple M4 Pro", "15.4"), ("Apple M10", "30")] {
+        let f = can(chip, macos);
+        assert!(f.verdict == Verdict::Ok && f.message.contains(" can run"), "{chip} {macos}: {f:?}");
+    }
+    for (chip, macos) in [("Apple M1", "26.5"), ("Apple M2 Ultra", "15.0"), ("Apple M3", "14.6"), ("Intel(R) Core(TM) i9", "15.0")] {
+        let f = can(chip, macos);
+        assert!(f.verdict == Verdict::Ok && f.message.contains("cannot"), "{chip} {macos}: {f:?}");
+    }
+    let unknown = get(&Machine { chip: None, macos: None, ..fine() }, "nested-virtualization");
+    assert_eq!(unknown.verdict, Verdict::Ok);
 }
 
 #[test]
