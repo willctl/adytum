@@ -77,7 +77,7 @@ async fn main() -> adytum::Result<()> {
     };
     cells.create(&vm).await?;
     let image = "docker.io/library/alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f".parse()?;
-    let job = CellSpec { name: "adytum-demo-job".parse()?, kind: Kind::Container(ContainerOptions { image }), parent: Some(vm.name.clone()), ..vm.clone() };
+    let job = CellSpec { name: "adytum-demo-job".parse()?, kind: Kind::Container(ContainerOptions::new(image)), parent: Some(vm.name.clone()), ..vm.clone() };
     cells.create(&job).await?;
     cells.start(&job.name).await?;
     let out = cells.driver_of(&job.name)?.exec(&job.name, &["id".into(), "-u".into()], ExecOpts::default()).await?;

@@ -23,6 +23,10 @@ pub enum RefusalCode {
     TooDeep,
     CloneHost,
     ChildTooBig,
+    RuncSealed,
+    OpenContainerHere,
+    CloneSourceMissing,
+    CloneHasCells,
 }
 
 impl RefusalCode {
@@ -45,6 +49,10 @@ impl RefusalCode {
             Self::TooDeep => "too_deep",
             Self::CloneHost => "clone_host",
             Self::ChildTooBig => "child_too_big",
+            Self::RuncSealed => "runc_sealed",
+            Self::OpenContainerHere => "open_container_here",
+            Self::CloneSourceMissing => "clone_source_missing",
+            Self::CloneHasCells => "clone_has_cells",
         }
     }
 }
@@ -96,6 +104,10 @@ mod tests {
             (RefusalCode::TooDeep, "too_deep"),
             (RefusalCode::CloneHost, "clone_host"),
             (RefusalCode::ChildTooBig, "child_too_big"),
+            (RefusalCode::RuncSealed, "runc_sealed"),
+            (RefusalCode::OpenContainerHere, "open_container_here"),
+            (RefusalCode::CloneSourceMissing, "clone_source_missing"),
+            (RefusalCode::CloneHasCells, "clone_has_cells"),
         ];
         for (code, text) in pairs {
             assert_eq!(code.as_str(), text);

@@ -203,7 +203,7 @@ fn host(n: &str, wall: &str) -> Cell {
 
 fn container(n: &str, wall: &str, parent: &str) -> CellSpec {
     let image = format!("docker.io/library/alpine@sha256:{}", "0".repeat(64)).parse().unwrap();
-    CellSpec { kind: Kind::Container(crate::ContainerOptions { image }), parent: Some(name(parent)), ..spec(n, wall) }
+    CellSpec { kind: Kind::Container(crate::ContainerOptions::new(image)), parent: Some(name(parent)), ..spec(n, wall) }
 }
 
 #[test]
@@ -295,6 +295,43 @@ fn a_child_asks_for_no_more_than_its_parent_has() {
     // A container's disk is the parent's own; it is not compared.
     s.resources = Resources { disk_gib: have.disk_gib * 10, ..have };
     assert!(check_create(&s, &[p]).is_ok());
+}
+
+#[test]
+fn a_sealed_container_runs_under_gvisor_only() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.sealed = true;
+    assert!(check_spec(&s).is_ok());
+    if let Kind::Container(options) = &mut s.kind {
+        options.runtime = crate::Runtime::Runc;
+    }
+    let r = check_spec(&s).err().unwrap();
+    assert_eq!(r.code, RefusalCode::RuncSealed);
+    s.sealed = false;
+    assert!(check_create(&s, &[host("adytum-p", "wall_a")]).is_ok(), "an open container may ask for runc");
+}
+
+#[test]
+fn a_container_on_this_machine_is_sealed() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.parent = None;
+    s.sealed = false;
+    let r = check_spec(&s).err().unwrap();
+    assert_eq!(r.code, RefusalCode::OpenContainerHere);
+    assert!(r.fix.contains("sealed"), "{r:?}");
+    s.sealed = true;
+    assert!(check_spec(&s).is_ok());
+}
+
+#[test]
+fn only_a_recorded_cell_with_no_cells_inside_is_cloned() {
+    let mut s = spec("adytum-b", "wall_a");
+    s.clone_from = Some(name("adytum-unrecorded"));
+    assert_eq!(code(check_create(&s, &[])), RefusalCode::CloneSourceMissing);
+    s.clone_from = Some(name("adytum-p"));
+    let child = Cell { id: CellId::from_bytes([3; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Stopped };
+    assert_eq!(code(check_create(&s, &[host("adytum-p", "wall_a"), child])), RefusalCode::CloneHasCells);
+    assert!(check_create(&s, &[host("adytum-p", "wall_a")]).is_ok());
 }
 
 #[test]

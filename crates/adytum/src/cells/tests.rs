@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::ledger::{Ledger, OpKind, Outcome};
 use super::Cells;
 use crate::testing::{FakeDriver, Leaves, Op};
-use crate::{Arch, CellName, CellSpec, CellState, ImagePin, Kind, LimaOptions, Refusal, RefusalCode, Resources};
+use crate::{Arch, CellId, CellName, CellSpec, CellState, ImagePin, Kind, LimaOptions, Refusal, RefusalCode, Resources};
 use crate::{Driver, Error};
 
 type T = Result<(), Box<dyn std::error::Error>>;
@@ -83,8 +83,8 @@ async fn kill_create(cut: Cut, tag: &str) -> T {
     {
         let cells = Cells::open(&dir, driver.clone())?;
         driver.fail_next(cut.0, cut.1);
-        cells.ledger.intend_create(&want)?;
-        assert!(driver.create(&want).await.is_err());
+        let (_, id) = cells.ledger.intend_create(&want, None)?;
+        assert!(driver.create(&want, &id).await.is_err());
         // dropped without settling
     }
     let cells = restart(&dir, &driver)?;
@@ -127,7 +127,8 @@ async fn kill_remove(cut: Cut, tag: &str) -> T {
         cells.create(&cell).await?;
         driver.fail_next(cut.0, cut.1);
         cells.ledger.intend(OpKind::Remove, &cell.name)?;
-        assert!(driver.remove(&cell.name).await.is_err());
+        let id = cells.get(&cell.name)?.id;
+        assert!(driver.remove(&cell.name, &id).await.is_err());
     }
     let cells = restart(&dir, &driver)?;
     assert_eq!(cells.ledger.open_ops()?.len(), 1);
@@ -255,7 +256,7 @@ async fn a_refusal_comes_before_any_intent() -> T {
 #[test]
 fn a_settled_operation_cannot_be_settled_twice() -> T {
     let ledger = Ledger::memory()?;
-    let op = ledger.intend_create(&spec("adytum-test-d")?)?;
+    let (op, _) = ledger.intend_create(&spec("adytum-test-d")?, None)?;
     ledger.settle(op, Outcome::Done)?;
     assert!(matches!(ledger.settle(op, Outcome::Done), Err(Error::Ledger(_))));
     Ok(())
@@ -287,8 +288,8 @@ fn two_handles_on_one_file_share_one_order_of_writes() -> T {
     let b = Ledger::open(&dir)?;
     let specs: Vec<CellSpec> = (0..20).map(|i| spec(&format!("adytum-test-w{i}"))).collect::<Result<_, _>>()?;
     std::thread::scope(|s| -> T {
-        let ha = s.spawn(|| specs.iter().step_by(2).try_for_each(|sp| a.intend_create(sp).map(drop)));
-        let hb = s.spawn(|| specs.iter().skip(1).step_by(2).try_for_each(|sp| b.intend_create(sp).map(drop)));
+        let ha = s.spawn(|| specs.iter().step_by(2).try_for_each(|sp| a.intend_create(sp, None).map(drop)));
+        let hb = s.spawn(|| specs.iter().skip(1).step_by(2).try_for_each(|sp| b.intend_create(sp, None).map(drop)));
         ha.join().map_err(|_| "thread a")??;
         hb.join().map_err(|_| "thread b")??;
         Ok(())
@@ -296,7 +297,7 @@ fn two_handles_on_one_file_share_one_order_of_writes() -> T {
     assert_eq!(a.cells()?.len(), 20);
     assert_eq!(b.open_ops()?.len(), 20);
     // The same name through the other handle is refused, not doubled.
-    assert!(matches!(b.intend_create(&specs[0]), Err(Error::Refused(Refusal { code: RefusalCode::NameTaken, .. }))));
+    assert!(matches!(b.intend_create(&specs[0], None), Err(Error::Refused(Refusal { code: RefusalCode::NameTaken, .. }))));
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
@@ -308,7 +309,7 @@ const HELPER_ENV: &str = "ADYTUM_LEDGER_HELPER";
 fn helper() -> T {
     let Ok(dir) = std::env::var(HELPER_ENV) else { return Ok(()) };
     let ledger = Ledger::open(Path::new(&dir))?;
-    ledger.intend_create(&spec("adytum-test-kill")?)?;
+    ledger.intend_create(&spec("adytum-test-kill")?, None)?;
     std::process::abort();
 }
 
@@ -342,7 +343,7 @@ fn host_spec(n: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
 
 fn child_spec(n: &str, parent: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
     let image = format!("docker.io/library/alpine@sha256:{}", "0".repeat(64)).parse()?;
-    Ok(CellSpec { kind: Kind::Container(crate::ContainerOptions { image }), parent: Some(name(parent)?), ..spec(n)? })
+    Ok(CellSpec { kind: Kind::Container(crate::ContainerOptions::new(image)), parent: Some(name(parent)?), ..spec(n)? })
 }
 
 fn lines(driver: &FakeDriver) -> Vec<String> {
@@ -489,10 +490,11 @@ async fn a_create_cut_inside_a_parent_is_removed_through_the_parent() -> T {
         let cells = Cells::open(&dir, driver.clone())?;
         cells.create(&host_spec("adytum-test-p")?).await?;
         cells.start(&name("adytum-test-p")?).await?;
-        cells.ledger.intend_create(&child)?;
+        let parent = cells.get(&name("adytum-test-p")?)?.id;
+        let (_, id) = cells.ledger.intend_create(&child, Some(parent))?;
         driver.fail_next(Op::Create, Leaves::Cell(CellState::Broken));
         let inside = cells.driver_of(&child.name)?;
-        assert!(inside.create(&child).await.is_err());
+        assert!(inside.create(&child, &id).await.is_err());
     }
     let cells = restart(&dir, &driver)?;
     let report = cells.reconcile().await?;
@@ -527,7 +529,7 @@ async fn a_foreign_cell_inside_a_parent_is_not_replaced() -> T {
     cells.create(&host_spec("adytum-test-p")?).await?;
     cells.start(&name("adytum-test-p")?).await?;
     // Made in the parent by someone else, so its listing shows it.
-    driver.create(&child_spec("adytum-test-c", "adytum-test-p")?).await?;
+    driver.create(&child_spec("adytum-test-c", "adytum-test-p")?, &CellId::from_bytes([9; 16])).await?;
     match cells.create(&child_spec("adytum-test-c", "adytum-test-p")?).await {
         Err(Error::Refused(r)) => assert_eq!(r.code, RefusalCode::NameTaken),
         other => panic!("{other:?}"),
@@ -573,5 +575,48 @@ async fn a_host_that_cannot_list_is_reported_and_the_rest_is_reconciled() -> T {
     // Once the host lists again, the lost cell goes.
     let report = cells.reconcile().await?;
     assert_eq!((report.removed, report.unlisted), (vec![name("adytum-test-c")?], vec![]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn removing_a_cell_in_a_stopped_parent_starts_the_parent_and_removes_it() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.stop(&name("adytum-test-p")?).await?;
+    let before = driver.calls().len();
+    cells.remove(&name("adytum-test-c")?).await?;
+    assert_eq!(lines(&driver)[before..], ["start adytum-test-p", "remove adytum-test-c"]);
+    assert_eq!(cells.list()?.len(), 1, "the child is gone, not Broken");
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn a_stale_running_parent_is_asked_again_before_a_remove() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    // Stopped behind Adytum's back: the ledger still says running.
+    driver.stop(&name("adytum-test-p")?).await?;
+    assert_eq!(state_of(&cells, "adytum-test-p"), Some(CellState::Running));
+    cells.remove(&name("adytum-test-c")?).await?;
+    assert_eq!(state_of(&cells, "adytum-test-p"), Some(CellState::Running), "started again for the remove");
+    assert_eq!(cells.list()?.len(), 1);
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn a_cell_of_the_same_name_made_by_someone_else_is_not_ours() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    // Removed behind Adytum's back and made again by someone else.
+    let other = CellId::from_bytes([9; 16]);
+    driver.lose(&name("adytum-test-c")?);
+    driver.create(&child_spec("adytum-test-c", "adytum-test-p")?, &other).await?;
+    let report = cells.reconcile().await?;
+    assert_eq!(report.removed, [name("adytum-test-c")?], "the recorded cell is gone");
+    assert_eq!(report.unrecorded, [name("adytum-test-c")?], "and what has its name is not ours");
+    assert!(driver.state(&name("adytum-test-c")?).is_some(), "left alone");
     Ok(())
 }

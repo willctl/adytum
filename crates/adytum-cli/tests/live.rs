@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const ID: adytum::CellId = adytum::CellId::from_bytes([7; 16]);
+
 const BIN: &str = env!("CARGO_BIN_EXE_adytum");
 
 struct Env {
@@ -595,7 +597,7 @@ async fn networks_scenario(env_home: &std::path::Path) {
     let specs = [net_spec(&a1, "wall_a", "lan"), net_spec(&a2, "wall_a", "lan"), net_spec(&b1, "wall_b", "lan")];
     let t = Instant::now();
     for s in &specs {
-        lima.create(s).await.unwrap();
+        lima.create(s, &ID).await.unwrap();
     }
     println!("  create 3 cells: {:.2}s", t.elapsed().as_secs_f64());
     let t = Instant::now();
@@ -649,12 +651,12 @@ async fn networks_scenario(env_home: &std::path::Path) {
 
     // Removing the cells removes the networks, the last one with the last cell.
     let t = Instant::now();
-    lima.remove(&specs[0].name).await.unwrap();
+    lima.remove(&specs[0].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[1]).await.unwrap().is_some(), "wall_a's network went while a cell still used it");
-    lima.remove(&specs[1].name).await.unwrap();
+    lima.remove(&specs[1].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[1]).await.unwrap().is_none(), "wall_a's network outlived its cells");
     assert!(lima.network_gateway(&specs[2]).await.unwrap().is_some());
-    lima.remove(&specs[2].name).await.unwrap();
+    lima.remove(&specs[2].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[2]).await.unwrap().is_none());
     println!("  remove 3 cells and their networks: {:.2}s", t.elapsed().as_secs_f64());
 }

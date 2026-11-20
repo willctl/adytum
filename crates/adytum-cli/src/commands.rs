@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use adytum::{Cell, CellName, CellSpec, CellState, ContainerOptions, GuestUser, Kind, LimaOptions, OciImage, Port, Resources, Wall};
+use adytum::{Cell, CellName, CellSpec, CellState, ContainerOptions, GuestUser, Kind, LimaOptions, OciImage, Port, Resources, Runtime, Wall};
 use adytum::{Cells, ExecOpts, Report};
 use serde_json::{json, Value};
 
@@ -99,6 +99,9 @@ fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result
     let lima_only = |flag: &str| usage(format!("--{flag} is for a Lima cell."), format!("Leave --{flag} out, or make a Lima cell."));
     let kind = match args.kind.as_deref().unwrap_or("lima") {
         "lima" => {
+            if args.runtime.is_some() {
+                return Err(usage("--runtime is for a container cell.", "Leave --runtime out, or make a container cell."));
+            }
             let image_name = args.image.as_deref().unwrap_or(adytum::lima::DEFAULT_IMAGE);
             let image = adytum::lima::image(image_name)
                 .ok_or_else(|| usage(format!("There is no image named {image_name:?}."), format!("Use one of: {}.", adytum::lima::image_names().join(", "))))?;
@@ -114,7 +117,12 @@ fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result
             let text = args.image.as_deref().ok_or_else(|| usage("A container cell needs an image.", "Give --image <reference>@sha256:<digest>."))?;
             let image: OciImage =
                 text.parse().map_err(|e| usage(format!("{e}."), "Give --image <reference>@sha256:<digest>, such as docker.io/library/alpine:3.22@sha256:<64 hex>."))?;
-            Kind::Container(ContainerOptions { image })
+            let runtime = match args.runtime.as_deref() {
+                None | Some("gvisor") => Runtime::Gvisor,
+                Some("runc") => Runtime::Runc,
+                Some(other) => return Err(usage(format!("There is no runtime named {other:?}."), "Use --runtime gvisor or --runtime runc.")),
+            };
+            Kind::Container(ContainerOptions { image, runtime })
         }
         other => return Err(usage(format!("There is no kind of cell named {other:?}."), "Use --kind lima or --kind container.")),
     };

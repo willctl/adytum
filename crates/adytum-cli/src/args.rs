@@ -24,6 +24,8 @@ pub struct CreateArgs {
     /// `lima` unless given.
     pub kind: Option<String>,
     pub parent: Option<String>,
+    /// `gvisor` unless given.
+    pub runtime: Option<String>,
     pub sealed: bool,
     pub containers: bool,
     pub nested_virtualization: bool,
@@ -67,10 +69,12 @@ Usage:
                                           container cells)
   adytum create <name> --kind container --image <ref>@sha256:<digest>
                        [--parent <cell>] [--sealed] [--cpus N] [--memory MiB]
+                       [--runtime gvisor|runc]
                                          (a container, in <cell> or through
-                                          docker here; in a cell it keeps the
-                                          cell's wall, and is sealed if the
-                                          cell is)
+                                          docker here, under gVisor unless
+                                          an open one asks for runc; in a
+                                          cell it keeps the cell's wall and
+                                          size, and is sealed if the cell is)
   adytum start <name>
   adytum stop <name>
   adytum rm <name>
@@ -95,7 +99,7 @@ command's own code.
 Cells are named adytum-<lowercase letters, digits, dashes>.
 ";
 
-const VALUE_FLAGS: [&str; 8] = ["wall", "cpus", "memory", "image", "port", "owner", "kind", "parent"];
+const VALUE_FLAGS: [&str; 9] = ["wall", "cpus", "memory", "image", "port", "owner", "kind", "parent", "runtime"];
 const SWITCHES: [&str; 3] = ["sealed", "containers", "nested-virtualization"];
 
 #[derive(Default)]
@@ -206,6 +210,7 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
                 match flag.as_str() {
                     "kind" => args.kind = Some(value.clone()),
                     "parent" => args.parent = Some(value.clone()),
+                    "runtime" => args.runtime = Some(value.clone()),
                     "wall" => args.wall = Some(value.clone()),
                     "image" => args.image = Some(value.clone()),
                     "cpus" => args.cpus = Some(number(flag, value)?),

@@ -149,7 +149,7 @@ impl Cells {
         }
         for cell in here(&cells).into_iter().filter(|c| !failed.iter().any(|u| u.kind == c.spec.kind.name())) {
             let name = &cell.spec.name;
-            match listed.iter().find(|l| &l.name == name) {
+            match listed.iter().find(|l| &l.name == name && l.id.is_none_or(|i| i == cell.id)) {
                 // The cells that ran in it went with it.
                 None => {
                     self.ledger.forget(name)?;
@@ -190,7 +190,9 @@ impl Cells {
     /// names. Every rule runs before anything is written. A cell that runs
     /// in another has that cell and the ones above it started first.
     pub async fn create(&self, spec: &CellSpec) -> Result<CellId, Error> {
-        crate::policy::check_create(spec, &self.list()?)?;
+        let cells = self.list()?;
+        crate::policy::check_create(spec, &cells)?;
+        let parent_id = spec.parent.as_ref().and_then(|p| find(&cells, p)).map(|c| c.id);
         if let Some(parent) = &spec.parent {
             self.bring_up(parent).await?;
         }
@@ -203,19 +205,24 @@ impl Cells {
             )
             .into());
         }
-        let op = self.ledger.intend_create(spec)?;
+        let (op, id) = self.ledger.intend_create(spec, parent_id)?;
         let made = match &spec.clone_from {
-            Some(from) => driver.clone_cell(from, spec).await,
-            None => driver.create(spec).await,
+            Some(from) => driver.clone_cell(from, spec, &id).await,
+            None => driver.create(spec, &id).await,
         };
         if let Err(e) = made {
-            if self.remove_tolerant(&spec.name).await.is_ok() {
+            // A name someone took meanwhile is theirs: nothing of ours to clean up.
+            let cleaned = match &e {
+                Error::Refused(r) if r.code == RefusalCode::NameTaken => Ok(()),
+                _ => self.remove_tolerant(&spec.name).await,
+            };
+            if cleaned.is_ok() {
                 self.ledger.settle(op, Outcome::Failed(e.to_string()))?;
             }
             return Err(e);
         }
         self.ledger.settle(op, Outcome::Done)?;
-        Ok(self.get(&spec.name)?.id)
+        Ok(id)
     }
 
     /// Starts the cells it runs in first, outermost first.
@@ -228,6 +235,7 @@ impl Cells {
 
     /// Stops the running cells inside it first, deepest first.
     pub async fn stop(&self, name: &CellName) -> Result<(), Error> {
+        self.refresh(name).await?;
         let cells = self.list()?;
         find(&cells, name).ok_or_else(|| Error::NotRecorded(name.clone()))?;
         for inner in descendants(&cells, name).into_iter().filter(|c| c.state == CellState::Running) {
@@ -239,9 +247,14 @@ impl Cells {
     /// Removes the cells inside it first, deepest first. One whose host is
     /// not running goes with this cell. A cell already gone counts as
     /// removed; one the driver fails to remove is left `Broken`.
+    /// A cell inside a stopped one has the cells it runs in started first,
+    /// so its own driver can remove it.
     pub async fn remove(&self, name: &CellName) -> Result<(), Error> {
+        self.refresh(name).await?;
+        if let Some(parent) = self.get(name)?.spec.parent {
+            self.bring_up(&parent).await?;
+        }
         let cells = self.list()?;
-        find(&cells, name).ok_or_else(|| Error::NotRecorded(name.clone()))?;
         for inner in descendants(&cells, name) {
             if ancestors(&cells, &inner.spec.name).iter().all(|c| c.state == CellState::Running) {
                 self.remove_one(&inner.spec.name).await?;
@@ -288,10 +301,55 @@ impl Cells {
         settled
     }
 
+    /// Only the cell's own driver saying the cell is gone counts; a host
+    /// that cannot be found is an error, not a removal.
     async fn remove_tolerant(&self, name: &CellName) -> Result<(), Error> {
-        match self.driver_of(name)?.remove(name).await {
-            Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
+        let id = self.get(name)?.id;
+        match self.driver_of(name)?.remove(name, &id).await {
+            Ok(()) => Ok(()),
+            Err(Error::NotFound { name: gone }) if gone == name.as_str() => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Asks the hosts of `name`, of the cells it runs in and of the cells
+    /// inside it for their states, outermost first, so a stop or a remove
+    /// does not act on a state the ledger kept from before. A host that
+    /// cannot be asked is left as recorded; reconcile reports it.
+    async fn refresh(&self, name: &CellName) -> Result<(), Error> {
+        let cells = self.list()?;
+        let me = find(&cells, name).ok_or_else(|| Error::NotRecorded(name.clone()))?;
+        let mut hosts: Vec<Option<CellName>> = Vec::new();
+        let inner = descendants(&cells, name);
+        for cell in ancestors(&cells, name).into_iter().rev().chain([me]).chain(inner.into_iter().rev()) {
+            if !hosts.contains(&cell.spec.parent) {
+                hosts.push(cell.spec.parent.clone());
+            }
+        }
+        for host in hosts {
+            let cells = self.list()?;
+            if host.as_ref().is_some_and(|h| find(&cells, h).map(|c| c.state) != Some(CellState::Running)) {
+                continue;
+            }
+            let here: Vec<&Cell> = cells.iter().filter(|c| c.spec.parent == host).collect();
+            let kinds: BTreeSet<KindName> = here.iter().map(|c| c.spec.kind.name()).collect();
+            let Ok(on) = self.host(&cells, host.as_ref()) else { continue };
+            for kind in kinds {
+                let Ok(listed) = (match self.drivers.driver(kind, on.clone()) {
+                    Ok(driver) => driver.list().await,
+                    Err(e) => Err(e),
+                }) else {
+                    continue;
+                };
+                for cell in here.iter().filter(|c| c.spec.kind.name() == kind) {
+                    if let Some(l) = listed.iter().find(|l| l.name == cell.spec.name && l.id.is_none_or(|i| i == cell.id)) {
+                        if l.state != cell.state {
+                            self.ledger.set_state(&cell.spec.name, l.state)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

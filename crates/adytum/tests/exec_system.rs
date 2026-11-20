@@ -193,3 +193,12 @@ async fn a_duplex_gives_stderr_while_the_child_runs_and_finish_leaves_it_out() -
     assert_eq!(duplex.finish().await?.stderr, b"kept\n");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_command_that_writes_too_much_is_stopped_with_a_clear_error() -> Res {
+    let over = adytum::exec::MAX_OUTPUT + 1024 * 1024;
+    let cmd = Command::new("head").env("PATH", SAFE_PATH).args(["-c", &over.to_string(), "/dev/zero"]).deadline(Duration::from_secs(30));
+    let err = SystemRunner::new().run(&cmd).await.unwrap_err();
+    assert!(matches!(&err, Error::Tool { .. }) && err.to_string().contains("more than 64 MiB"), "{err}");
+    Ok(())
+}

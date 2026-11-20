@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::exec::{tail, Command, Duplex, Output, Runner, SystemRunner};
-use crate::{CellName, CellSpec, CellState};
+use crate::{CellId, CellName, CellSpec, CellState};
 use crate::{Driver, Error, ExecOpts, GuestUser, Listed};
 use async_trait::async_trait;
 
@@ -121,7 +121,7 @@ fn refuse(what: &str) -> Error {
 
 #[async_trait]
 impl Driver for OpenShell {
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error> {
+    async fn create(&self, spec: &CellSpec, _id: &CellId) -> Result<(), Error> {
         if !spec.ports.is_empty() {
             return Err(refuse("publishing ports from an OpenShell sandbox"));
         }
@@ -209,7 +209,7 @@ impl Driver for OpenShell {
         Err(refuse("stopping an OpenShell sandbox (remove it instead)"))
     }
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error> {
+    async fn remove(&self, name: &CellName, _id: &CellId) -> Result<(), Error> {
         let sandbox = sandbox_name(name)?;
         let out = self.run(self.command(&delete(&sandbox))?.deadline(CREATE_DEADLINE), "openshell sandbox delete").await?;
         if out.success() || not_found(&out.stderr_lossy()) {
@@ -228,6 +228,6 @@ impl Driver for OpenShell {
                 stderr: "There is more than one page of sandboxes. Delete old ones and list again.".to_owned(),
             });
         }
-        Ok(parsed.entries().into_iter().filter_map(|(name, phase)| Some(Listed { name: name?.parse::<CellName>().ok()?, state: state_of(phase.as_ref()) })).collect())
+        Ok(parsed.entries().into_iter().filter_map(|(name, phase)| Some(Listed { name: name?.parse::<CellName>().ok()?, state: state_of(phase.as_ref()), id: None })).collect())
     }
 }

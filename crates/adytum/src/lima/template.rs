@@ -5,7 +5,7 @@
 use crate::Error;
 use crate::{Arch, CellSpec, Kind, LimaOptions};
 
-use crate::lima::guest::provision_script;
+use crate::lima::guest::boot_script;
 
 use crate::lima::network::lima_network_name;
 
@@ -110,7 +110,7 @@ pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
     line("provision:");
     line("- mode: system");
     line("  script: |");
-    for script_line in provision_script().lines() {
+    for script_line in script(options)?.lines() {
         if script_line.is_empty() {
             line("");
         } else {
@@ -162,12 +162,22 @@ pub(crate) fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, Error> {
         format!(".mounts = {}", serde_json::Value::Array(mounts)),
         format!(".portForwards = {}", serde_json::Value::Array(forwards)),
         format!(".containerd.system = {}", options.containers),
+        format!(".provision = {}", serde_json::json!([{ "mode": "system", "script": script(options)? }])),
         format!(".nestedVirtualization = {}", options.nested_virtualization),
     ];
     if let Some(name) = network_for(spec) {
         edits.push(format!(".networks = {}", serde_json::json!([{ "lima": name }])));
     }
     Ok(edits)
+}
+
+fn script(options: &LimaOptions) -> Result<String, Error> {
+    let pin = if options.containers {
+        Some(crate::lima::gvisor(options.image.arch).ok_or_else(|| unsupported("containers on this architecture: no gVisor release is pinned for it"))?)
+    } else {
+        None
+    };
+    Ok(boot_script(pin.as_ref()))
 }
 
 /// Made from the cell's own wall, so a cell only ever joins its wall's network.
@@ -313,6 +323,20 @@ mod tests {
         assert!(!text.contains("nestedVirtualization"), "{text}");
         let text = render(&with(true, false)).unwrap();
         assert!(text.contains("containerd:\n  system: true\n  user: false\n"), "{text}");
+    }
+
+    #[test]
+    fn a_cell_that_holds_containers_installs_gvisor_after_the_firewall() {
+        let text = render(&with(true, false)).unwrap();
+        assert_eq!(text.matches("- mode: system\n  script: |\n").count(), 1, "{text}");
+        let firewall = text.find("table inet adytum").unwrap();
+        let gvisor = text.find("sha256sum -c").unwrap();
+        assert!(firewall < gvisor && gvisor < text.find("portForwards:").unwrap());
+        assert!(!render(&with(false, false)).unwrap().contains("gvisor"));
+        let edits = clone_edits(&with(true, false)).unwrap();
+        let provision = edits.iter().find(|e| e.starts_with(".provision = ")).unwrap();
+        assert!(provision.contains("sha256sum -c") && provision.contains("table inet adytum"), "{provision}");
+        assert!(!clone_edits(&with(false, false)).unwrap().iter().any(|e| e.contains("gvisor")));
     }
 
     #[test]

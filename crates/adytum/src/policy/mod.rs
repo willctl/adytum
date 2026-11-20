@@ -11,7 +11,36 @@ pub fn check_spec(spec: &CellSpec) -> Result<(), Refusal> {
     ports_on_localhost(spec)?;
     nested_publishes_nothing(spec)?;
     sealed_has_no_mounts(spec)?;
-    nested_mounts_nothing(spec)
+    nested_mounts_nothing(spec)?;
+    sealed_containers_run_under_gvisor(spec)?;
+    containers_here_are_sealed(spec)
+}
+
+/// A container on this machine with a network reaches the machine: docker's
+/// bridge, and Docker Desktop's host.docker.internal, lead to its loopback
+/// and its LAN, and no firewall of Adytum's stands in between.
+fn containers_here_are_sealed(spec: &CellSpec) -> Result<(), Refusal> {
+    if spec.parent.is_none() && spec.kind.name() == crate::KindName::Container && !spec.sealed {
+        return Err(Refusal::new(
+            RefusalCode::OpenContainerHere,
+            format!("{} would be a container on this machine with a network, which reaches this machine.", spec.name),
+            "Make it sealed, or run it in a Lima cell made with containers on, behind that cell's firewall.",
+        ));
+    }
+    Ok(())
+}
+
+/// Under runc a flaw in the parent's kernel gives root in the parent, and
+/// root there can lift the firewall; a sealed cell promises more than that.
+fn sealed_containers_run_under_gvisor(spec: &CellSpec) -> Result<(), Refusal> {
+    match &spec.kind {
+        crate::Kind::Container(options) if spec.sealed && options.runtime == crate::Runtime::Runc => Err(Refusal::new(
+            RefusalCode::RuncSealed,
+            format!("{} is sealed, and a sealed container runs under gVisor, not runc.", spec.name),
+            "Leave the runtime at gVisor, or make the container not sealed.",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Every rule against the cells that exist; the first refusal wins.
@@ -22,7 +51,25 @@ pub fn check_create(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
     walls_share_no_network(spec, cells)?;
     walls_share_no_mount(spec, cells)?;
     walls_share_no_clone_source(spec, cells)?;
+    clone_of_a_recorded_cell_with_none_inside(spec, cells)?;
     clone_on_the_same_host(spec, cells)
+}
+
+/// A source the ledger never recorded has no wall to check, and a cell
+/// with cells inside would hand its copy their files unrecorded.
+fn clone_of_a_recorded_cell_with_none_inside(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
+    let Some(source) = &spec.clone_from else { return Ok(()) };
+    if find(cells, source).is_none() {
+        return Err(Refusal::new(RefusalCode::CloneSourceMissing, format!("Adytum has no record of {source}, so it cannot be cloned."), "Clone a cell `adytum ls` shows."));
+    }
+    if cells.iter().any(|c| c.spec.parent.as_ref() == Some(source)) {
+        return Err(Refusal::new(
+            RefusalCode::CloneHasCells,
+            format!("{source} has cells inside it, and a clone would carry them along unrecorded."),
+            "Remove the cells inside it first, or clone another cell.",
+        ));
+    }
+    Ok(())
 }
 
 fn is_loopback(ip: IpAddr) -> bool {

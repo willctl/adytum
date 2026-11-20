@@ -11,6 +11,8 @@ use adytum::lima::Lima;
 use adytum::testing::{failed, ok, FakeRunner};
 use adytum::{CellName, CellSpec, CellState, Driver, Error, ExecOpts, Kind, LimaOptions, Port, RefusalCode, Resources};
 
+const ID: adytum::CellId = adytum::CellId::from_bytes([7; 16]);
+
 const NAME: &str = "adytum-test-golden";
 
 fn name() -> CellName {
@@ -89,7 +91,7 @@ async fn limactl_gets_only_lima_home_path_and_home() {
     let (lima, fake, home) = lima(FakeRunner::new(|c| if c.argv[1] == "list" { listed(&[(NAME, "Stopped")]) } else { ok("") }));
     lima.start(&name()).await.unwrap();
     lima.stop(&name()).await.unwrap();
-    lima.remove(&name()).await.unwrap();
+    lima.remove(&name(), &ID).await.unwrap();
     for call in fake.calls() {
         assert_eq!(call.env.keys().filter(|k| !["PATH", "HOME"].contains(&k.as_str())).collect::<Vec<_>>(), ["LIMA_HOME"], "{:?}", call.argv);
         assert_eq!(call.env["LIMA_HOME"], home.0.to_string_lossy());
@@ -99,7 +101,7 @@ async fn limactl_gets_only_lima_home_path_and_home() {
 #[tokio::test]
 async fn a_failing_create_surfaces_its_stderr_and_leaves_no_template() {
     let (lima, fake, home) = lima(FakeRunner::replies(vec![failed(1, "level=fatal msg=\"disk is full\"\n")]));
-    let err = lima.create(&spec()).await.unwrap_err();
+    let err = lima.create(&spec(), &ID).await.unwrap_err();
     assert!(matches!(err, Error::Tool { status: Some(1), .. }) && err.to_string().contains("disk is full"), "{err}");
     let template = home.0.join(format!("_templates/{NAME}.yaml"));
     assert_eq!(fake.argv(), [argv(&["limactl", "create", &format!("--name={NAME}"), "--tty=false", &template.to_string_lossy()])]);
@@ -129,7 +131,22 @@ fn start_calls(starts: usize) -> Vec<Vec<String>> {
 async fn a_start_whose_host_agent_was_late_is_stopped_and_tried_once_more() {
     let (lima, fake, _home) = lima(FakeRunner::replies(vec![listed(&[(NAME, "Stopped")]), failed(1, LATE), ok(""), ok("")]));
     lima.start(&name()).await.unwrap();
-    assert_eq!(fake.argv(), start_calls(2));
+    assert_eq!(fake.argv(), [start_calls(2), vec![ready_probe()]].concat());
+}
+
+fn ready_probe() -> Vec<String> {
+    as_cell(&["test", "-e", "/run/adytum/ready"])
+}
+
+#[tokio::test]
+async fn a_cell_whose_boot_script_failed_is_stopped_again_with_the_logs_end() {
+    let (lima, fake, _home) = lima(FakeRunner::replies(vec![listed(&[(NAME, "Stopped")]), ok(""), failed(1, ""), ok("tar (child): bzip2: Cannot exec\n"), ok("")]));
+    let err = lima.start(&name()).await.unwrap_err();
+    assert!(matches!(&err, Error::Tool { .. }) && err.to_string().contains("bzip2: Cannot exec"), "{err}");
+    let calls = fake.argv();
+    assert_eq!(calls[2], ready_probe());
+    assert_eq!(calls[3], shell(&["sudo", "-n", "--", "tail", "-n", "20", "/var/log/cloud-init-output.log"]));
+    assert_eq!(calls[4], argv(&["limactl", "stop", "--force", "--tty=false", NAME]));
 }
 
 #[tokio::test]
@@ -276,10 +293,10 @@ async fn a_spec_that_breaks_a_host_rule_never_reaches_limactl() {
     let (lima, fake, _home) = lima(FakeRunner::new(|_| ok("")));
     let mut sealed = spec();
     sealed.mounts.push(adytum::Mount { source: "/Users".into(), target: "/mnt".into(), writable: true });
-    assert!(matches!(lima.create(&sealed).await, Err(Error::Refused(r)) if r.code == RefusalCode::SealedCellMount));
+    assert!(matches!(lima.create(&sealed, &ID).await, Err(Error::Refused(r)) if r.code == RefusalCode::SealedCellMount));
     let mut to = clone_spec();
     to.ports[0].bind = "0.0.0.0".parse().unwrap();
-    assert!(matches!(lima.clone_cell(&name(), &to).await, Err(Error::Refused(r)) if r.code == RefusalCode::PortNotLocalhost));
+    assert!(matches!(lima.clone_cell(&name(), &to, &ID).await, Err(Error::Refused(r)) if r.code == RefusalCode::PortNotLocalhost));
     assert_eq!(fake.calls(), []);
 }
 
@@ -287,7 +304,7 @@ async fn a_spec_that_breaks_a_host_rule_never_reaches_limactl() {
 async fn a_home_too_long_for_lima_sockets_or_not_absolute_is_refused() {
     let fake = Arc::new(FakeRunner::new(|_| ok("")));
     let long = Lima::new(fake.clone(), "limactl".into(), PathBuf::from(format!("/{}", "a".repeat(90)))).unwrap();
-    assert!(matches!(long.create(&spec()).await, Err(Error::BadPath { .. })));
+    assert!(matches!(long.create(&spec(), &ID).await, Err(Error::BadPath { .. })));
     assert!(matches!(Lima::new(fake.clone(), "limactl".into(), "relative/lima".into()), Err(Error::BadPath { .. })));
     assert_eq!(fake.calls(), []);
 }
@@ -296,8 +313,10 @@ async fn a_home_too_long_for_lima_sockets_or_not_absolute_is_refused() {
 async fn a_clone_asks_for_the_specs_settings_and_needs_a_stopped_free_source() {
     let both = listed(&[(NAME, "Stopped"), ("adytum-test-golden-clone", "Stopped")]);
     let (lima, fake, _home) = lima(FakeRunner::replies(vec![listed(&[(NAME, "Stopped")]), ok(""), listed(&[(NAME, "Running")]), both, ok("")]));
-    lima.clone_cell(&name(), &clone_spec()).await.unwrap();
+    lima.clone_cell(&name(), &clone_spec(), &ID).await.unwrap();
     let forwards = r#".portForwards = [{"guestPort":8080,"hostPort":18080,"hostIP":"127.0.0.1","proto":"tcp"},{"guestIP":"127.0.0.1","proto":"any","guestPortRange":[1,65535],"ignore":true},{"guestIP":"0.0.0.0","proto":"any","guestPortRange":[1,65535],"ignore":true},{"guestIP":"::","proto":"any","guestPortRange":[1,65535],"ignore":true}]"#;
+    let asked = fake.argv()[1].clone();
+    let provision = asked.iter().find(|a| a.starts_with(".provision = [{\"mode\":\"system\",\"script\":\"#!/bin/sh")).expect("the clone gets the spec's boot scripts").clone();
     let set = [
         "--set",
         ".cpus = 2",
@@ -310,11 +329,35 @@ async fn a_clone_asks_for_the_specs_settings_and_needs_a_stopped_free_source() {
         "--set",
         ".containerd.system = false",
         "--set",
+        &provision,
+        "--set",
         ".nestedVirtualization = false",
     ];
-    assert_eq!(fake.argv()[1], argv(&[&["limactl", "clone", "--tty=false"][..], &set, &[NAME, "adytum-test-golden-clone"]].concat()));
-    assert!(matches!(lima.clone_cell(&name(), &clone_spec()).await, Err(Error::Unsupported { .. })), "a running source");
-    assert!(matches!(lima.clone_cell(&name(), &clone_spec()).await, Err(Error::Refused(r)) if r.code == RefusalCode::NameTaken));
-    assert!(matches!(lima.clone_cell(&name(), &clone_spec()).await, Err(Error::NotFound { .. })), "a missing source");
+    assert_eq!(asked, argv(&[&["limactl", "clone", "--tty=false"][..], &set, &[NAME, "adytum-test-golden-clone"]].concat()));
+    assert!(matches!(lima.clone_cell(&name(), &clone_spec(), &ID).await, Err(Error::Unsupported { .. })), "a running source");
+    assert!(matches!(lima.clone_cell(&name(), &clone_spec(), &ID).await, Err(Error::Refused(r)) if r.code == RefusalCode::NameTaken));
+    assert!(matches!(lima.clone_cell(&name(), &clone_spec(), &ID).await, Err(Error::NotFound { .. })), "a missing source");
     assert_eq!(fake.argv().iter().filter(|a| a[1] == "clone").count(), 1);
+}
+
+#[tokio::test]
+async fn a_command_in_the_cell_that_says_does_not_exist_is_its_own_failure() {
+    let nested = "time=\"x\" level=fatal msg=\"binary not installed \\\"containerd-shim-runsc-v1\\\": file does not exist\"\n";
+    let (lima, _, _home) = lima(FakeRunner::new(move |_| failed(1, nested)));
+    let out = lima.exec(&name(), &argv(&["nerdctl", "start", "adytum-test-box"]), ExecOpts::root()).await.unwrap();
+    assert_eq!((out.status, out.stderr_lossy().as_str()), (Some(1), nested));
+}
+
+#[tokio::test]
+async fn a_copy_out_of_a_fifo_a_device_or_too_much_is_refused_before_it_starts() {
+    let too_much = format!("{}\n{}\n", adytum::copy::MAX_COPY, 1);
+    for (found, what) in [("12\nspecial\n".to_owned(), "a FIFO"), (too_much, "more than")] {
+        let answer = found.clone();
+        let (lima, fake, _home) = lima(FakeRunner::new(move |c| if c.argv.contains(&"find".to_owned()) { ok(&answer) } else { ok("") }));
+        let err = lima.copy_out(&name(), "/tmp/x", Path::new("/tmp/out")).await.unwrap_err();
+        assert!(matches!(&err, Error::Unsupported { .. }) && err.to_string().contains(what), "{err}");
+        assert!(fake.argv().iter().all(|a| a[1] != "copy"), "{:?}", fake.argv());
+        let find = fake.argv().into_iter().find(|a| a.contains(&"find".to_owned())).unwrap();
+        assert!(find.windows(2).any(|w| w == ["find", "-L"]) && find.contains(&"sudo".to_owned()), "{find:?}");
+    }
 }

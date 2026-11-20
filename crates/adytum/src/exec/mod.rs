@@ -10,7 +10,7 @@ mod system;
 pub use command::Command;
 pub use duplex::{Duplex, DuplexControl};
 pub use spawned::{Exit, Spawned, StderrTail};
-pub use system::SystemRunner;
+pub use system::{SystemRunner, MAX_OUTPUT};
 
 use async_trait::async_trait;
 

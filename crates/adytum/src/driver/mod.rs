@@ -1,11 +1,11 @@
 #[cfg(any(feature = "lima", feature = "container"))]
-pub(crate) mod copy;
+pub mod copy;
 
 use std::path::Path;
 use std::time::Duration;
 
 use crate::exec::{Duplex, Output};
-use crate::{CellName, CellSpec, CellState, Error, GuestUser};
+use crate::{CellId, CellName, CellSpec, CellState, Error, GuestUser};
 use async_trait::async_trait;
 
 /// `argv` with `env` put in front through `env(1)`, refused if it holds a
@@ -80,14 +80,19 @@ impl ExecOpts {
 pub struct Listed {
     pub name: CellName,
     pub state: CellState,
+    /// The id the cell was made with, for a driver that can record one on
+    /// the cell itself. A cell of the same name with another id is not the
+    /// one the ledger recorded.
+    pub id: Option<CellId>,
 }
 
 /// What a kind of cell can do. Use it through [`Cells`](crate::Cells), which
 /// records each change of a cell's life in the ledger.
 #[async_trait]
 pub trait Driver: Send + Sync {
-    /// Makes a stopped cell.
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error>;
+    /// Makes a stopped cell. `id` is the ledger's for it: a driver that can
+    /// mark the cell with it does, and removes only a cell that carries it.
+    async fn create(&self, spec: &CellSpec, id: &CellId) -> Result<(), Error>;
 
     /// Returns once commands can run in the cell.
     async fn start(&self, name: &CellName) -> Result<(), Error>;
@@ -109,15 +114,17 @@ pub trait Driver: Send + Sync {
 
     async fn stop(&self, name: &CellName) -> Result<(), Error>;
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error>;
+    /// `NotFound` for this name when it is gone, or when what has the name
+    /// does not carry `id`, which is then left alone.
+    async fn remove(&self, name: &CellName, id: &CellId) -> Result<(), Error>;
 
     /// Only cells named `adytum-*`.
     async fn list(&self) -> Result<Vec<Listed>, Error>;
 
     /// Makes `to` as a stopped copy of the stopped cell `from`, with the
     /// settings `to` lists.
-    async fn clone_cell(&self, from: &CellName, to: &CellSpec) -> Result<(), Error> {
-        let _ = (from, to);
+    async fn clone_cell(&self, from: &CellName, to: &CellSpec, id: &CellId) -> Result<(), Error> {
+        let _ = (from, to, id);
         Err(Error::Unsupported { what: "cloning a cell".to_owned() })
     }
 }

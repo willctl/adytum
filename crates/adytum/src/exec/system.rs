@@ -2,9 +2,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
+
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::exec::duplex::{Duplex, DuplexControl};
@@ -74,7 +77,11 @@ async fn stop(child: &mut Child, pgid: Option<u32>, grace: Duration) {
     let _ = child.wait().await;
 }
 
-fn spawn_reader<R>(mut stream: R) -> JoinHandle<Vec<u8>>
+/// What [`Runner::run`] keeps of stdout and of stderr each; a command that
+/// writes more is stopped, since its output is held in memory.
+pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
+fn spawn_reader<R>(mut stream: R, over: Arc<Notify>) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -84,6 +91,10 @@ where
         loop {
             match stream.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
+                Ok(n) if all.len() + n > MAX_OUTPUT => {
+                    over.notify_one();
+                    break;
+                }
                 Ok(n) => all.extend_from_slice(&buf[..n]),
             }
         }
@@ -118,8 +129,9 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
     if let (Some(bytes), Some(pipe)) = (cmd.stdin(), child.stdin.take()) {
         tokio::spawn(write_stdin(pipe, bytes.to_vec()));
     }
-    let out = child.stdout.take().map(spawn_reader);
-    let err = child.stderr.take().map(spawn_reader);
+    let over = Arc::new(Notify::new());
+    let out = child.stdout.take().map(|s| spawn_reader(s, over.clone()));
+    let err = child.stderr.take().map(|s| spawn_reader(s, over.clone()));
 
     let deadline = async {
         match cmd.deadline_limit() {
@@ -128,9 +140,11 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
         }
     };
     let mut timed_out = false;
+    let mut too_much = false;
     let status = tokio::select! {
         waited = child.wait() => Some(waited.map_err(|source| Error::Child { what: "wait for the command", source })?),
         () = deadline => { timed_out = true; None }
+        () = over.notified() => { too_much = true; None }
     };
     let code = match status {
         Some(s) => s.code(),
@@ -139,8 +153,15 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
             None
         }
     };
-    let stdout = collect(out, !timed_out).await;
-    let stderr = collect(err, !timed_out).await;
+    let stdout = collect(out, status.is_some()).await;
+    let stderr = collect(err, status.is_some()).await;
+    if too_much {
+        return Err(Error::Tool {
+            what: cmd.program().to_string_lossy().into_owned(),
+            status: None,
+            stderr: format!("It wrote more than {} MiB, and was stopped: run a command that writes less, or stream it.", MAX_OUTPUT / (1024 * 1024)),
+        });
+    }
     Ok(Output { status: code, stdout, stderr, timed_out })
 }
 

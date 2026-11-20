@@ -67,6 +67,25 @@ impl LimaOptions {
 #[serde(deny_unknown_fields)]
 pub struct ContainerOptions {
     pub image: OciImage,
+    #[serde(default)]
+    pub runtime: Runtime,
+}
+
+impl ContainerOptions {
+    pub fn new(image: OciImage) -> ContainerOptions {
+        ContainerOptions { image, runtime: Runtime::default() }
+    }
+}
+
+/// What runs a container. gVisor gives it a kernel of its own in user
+/// space, so a flaw in the parent's kernel is not one step away; runc runs
+/// it on the parent's kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Runtime {
+    #[default]
+    Gvisor,
+    Runc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -230,10 +249,10 @@ mod tests {
     #[test]
     fn a_container_spec_reads_back_what_it_wrote() {
         let mut spec: CellSpec = serde_json::from_str(GOLDEN).unwrap();
-        spec.kind = Kind::Container(ContainerOptions { image: format!("docker.io/library/alpine:3.22@sha256:{}", "ab".repeat(32)).parse().unwrap() });
+        spec.kind = Kind::Container(ContainerOptions::new(format!("docker.io/library/alpine:3.22@sha256:{}", "ab".repeat(32)).parse().unwrap()));
         spec.parent = Some("adytum-host".parse().unwrap());
         let text = serde_json::to_string(&spec).unwrap();
-        assert!(text.contains(r#""kind":{"container":{"image":"docker.io/library/alpine:3.22@sha256:abab"#), "{text}");
+        assert!(text.contains(r#""kind":{"container":{"image":"docker.io/library/alpine:3.22@sha256:abab"#) && text.contains(r#""runtime":"gvisor""#), "{text}");
         assert_eq!(serde_json::from_str::<CellSpec>(&text).unwrap(), spec);
         spec.kind = Kind::OpenShell;
         assert!(serde_json::to_string(&spec).unwrap().contains(r#""kind":"openshell""#));
@@ -250,7 +269,7 @@ mod tests {
             assert!(!Kind::Lima(lima.clone()).hosts(kind), "{kind:?}");
         }
         let image: OciImage = format!("a@sha256:{}", "0".repeat(64)).parse().unwrap();
-        assert!(!Kind::Container(ContainerOptions { image }).hosts(KindName::Container));
+        assert!(!Kind::Container(ContainerOptions::new(image)).hosts(KindName::Container));
         assert!(!Kind::OpenShell.hosts(KindName::Container));
     }
 

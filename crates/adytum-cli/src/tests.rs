@@ -367,7 +367,11 @@ async fn the_nesting_rules_answer_through_the_command() {
     assert_eq!(rig.go("create adytum-test-h --containers").await.code, 0);
     let r = rig.go(&format!("{child} adytum-test-h --port 18080:80")).await;
     assert_eq!(r.json()["error"]["code"], "nested_port");
+    let r = rig.go(&format!("{child} adytum-test-h --sealed --runtime runc")).await;
+    assert_eq!(r.json()["error"]["code"], "runc_sealed");
     assert!(rig.calls().iter().all(|c| !c.contains("adytum-test-c")), "{:?}", rig.calls());
+    let r = rig.go(&format!("{child} adytum-test-h --runtime runc")).await;
+    assert_eq!(r.code, 0, "an open container may run under runc: {}", r.out);
 }
 
 #[tokio::test]
@@ -379,6 +383,8 @@ async fn a_wrong_kind_or_image_is_a_usage_error_before_the_ledger_opens() {
         format!("create adytum-test-c --kind container --image {IMAGE} --containers"),
         format!("create adytum-test-c --kind container --image {IMAGE} --nested-virtualization"),
         "create adytum-test-c --kind vm".to_owned(),
+        format!("create adytum-test-c --kind container --image {IMAGE} --runtime kata"),
+        "create adytum-test-c --runtime runc".to_owned(),
         "create adytum-test-c --image nonesuch".to_owned(),
     ] {
         let r = rig.go(&format!("{line} --json")).await;

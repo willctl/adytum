@@ -96,6 +96,47 @@ systemctl daemon-reload
 systemctl enable adytum-firewall.service >/dev/null 2>&1
 "#;
 
+/// Lima starts a cell even when its boot script fails, so the script's
+/// last step leaves this file and the driver looks for it after a start.
+pub(crate) const READY: &str = "/run/adytum/ready";
+
+/// What a cell runs as root at every boot: the firewall, then for a cell
+/// that holds containers gVisor's runsc and containerd shim, installed once
+/// from the pinned archive and checked against its sha256 before anything
+/// is unpacked, then the ready file. A failed step ends the script before
+/// the ready file.
+pub(crate) fn boot_script(gvisor: Option<&crate::lima::GvisorPin>) -> String {
+    let mut script = provision_script();
+    if let Some(pin) = gvisor {
+        let hex = pin.digest.strip_prefix("sha256:").unwrap_or(&pin.digest);
+        script.push_str(&GVISOR.replace("@VERSION@", &pin.version).replace("@URL@", &pin.location).replace("@SHA256@", hex));
+    }
+    script.push_str("\n# The cell is ready only if every step above held.\ninstall -d -m 0755 /run/adytum\ntouch ");
+    script.push_str(READY);
+    script.push('\n');
+    script
+}
+
+const GVISOR: &str = r#"
+# gVisor, so a container gets a kernel of its own.
+marker=/usr/local/lib/adytum/gvisor-@VERSION@
+if [ ! -e "$marker" ]; then
+  dir=$(mktemp -d)
+  curl -fsSL --retry 3 -o "$dir/gvisor.tar.zstd" "@URL@"
+  echo "@SHA256@  $dir/gvisor.tar.zstd" | sha256sum -c --quiet -
+  tar -x --zstd --no-same-owner -f "$dir/gvisor.tar.zstd" -C "$dir" runsc containerd-shim-runsc-v1 gvisor-bin
+  install -m 0755 "$dir/runsc" "$dir/containerd-shim-runsc-v1" /usr/local/bin/
+  # runsc starts its sentry and helpers from here.
+  rm -rf /usr/local/bin/gvisor-bin
+  mv "$dir/gvisor-bin" /usr/local/bin/gvisor-bin
+  chmod -R go-w /usr/local/bin/gvisor-bin
+  rm -r "$dir"
+  install -d -m 0755 /usr/local/lib/adytum
+  touch "$marker"
+fi
+/usr/local/bin/runsc --version >/dev/null
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,11 +151,37 @@ mod tests {
     }
 
     #[test]
-    fn the_script_is_valid_shell() {
-        let mut sh = std::process::Command::new("sh").arg("-n").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        std::io::Write::write_all(&mut sh.stdin.take().unwrap(), provision_script().as_bytes()).unwrap();
-        let out = sh.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    fn the_scripts_are_valid_shell() {
+        let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
+        for script in [boot_script(None), boot_script(Some(&pin))] {
+            let mut sh = std::process::Command::new("sh").arg("-n").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            std::io::Write::write_all(&mut sh.stdin.take().unwrap(), script.as_bytes()).unwrap();
+            let out = sh.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    #[test]
+    fn gvisor_is_checked_against_its_pin_before_it_is_unpacked_and_installed_once() {
+        let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
+        let script = boot_script(Some(&pin));
+        let hex = pin.digest.strip_prefix("sha256:").unwrap();
+        assert!(script.contains(&format!("echo \"{hex}  $dir/gvisor.tar.zstd\" | sha256sum -c --quiet -")), "{script}");
+        assert!(script.contains(&pin.location) && script.contains(&format!("gvisor-{}", pin.version)));
+        assert!(at(&script, "sha256sum -c") < at(&script, "tar -x"), "nothing is unpacked before the check");
+        assert!(at(&script, "if [ ! -e \"$marker\" ]") < at(&script, "curl"));
+        assert!(at(&script, "nft -f /etc/adytum/firewall.nft") < at(&script, "curl"), "the firewall comes first");
+        assert!(!boot_script(None).contains("gvisor"));
+    }
+
+    #[test]
+    fn the_ready_file_is_the_last_step_of_a_script_that_stops_at_the_first_failure() {
+        let pin = crate::lima::gvisor(crate::Arch::Aarch64).unwrap();
+        for script in [boot_script(None), boot_script(Some(&pin))] {
+            assert!(script.starts_with("#!/bin/sh\n# Written by adytum. Runs as root at every boot.\nset -eu\n"), "{script}");
+            assert!(script.trim_end().ends_with(&format!("touch {READY}")), "{script}");
+            assert_eq!(script.matches("#!/bin/sh").count(), 1);
+        }
     }
 
     #[test]

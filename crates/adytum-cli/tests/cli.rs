@@ -43,7 +43,7 @@ fn ls_with_no_cells_needs_no_limactl() {
     assert_eq!(code, 0);
     let value: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON object");
     assert_eq!(value["cells"], serde_json::json!([]));
-    assert_eq!(value["reconciled"], serde_json::json!({ "removed": [], "finished": [], "unrecorded": [] }));
+    assert_eq!(value["reconciled"], serde_json::json!({ "removed": [], "finished": [], "unrecorded": [], "unlisted": [] }));
 }
 
 #[test]

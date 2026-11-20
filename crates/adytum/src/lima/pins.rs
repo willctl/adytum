@@ -1,4 +1,4 @@
-use crate::ImagePin;
+use crate::{Arch, ImagePin};
 
 const PINS: &str = include_str!("../../pins.json");
 
@@ -20,6 +20,31 @@ pub fn image_names() -> Vec<String> {
     all().into_iter().map(|(n, _)| n).collect()
 }
 
+/// The gVisor release a Lima cell that holds containers installs: its
+/// archive, and the sha256 the guest checks it against before unpacking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GvisorPin {
+    pub version: String,
+    pub location: String,
+    pub digest: String,
+}
+
+pub fn gvisor(arch: Arch) -> Option<GvisorPin> {
+    let value = serde_json::from_str::<serde_json::Value>(PINS).ok()?;
+    let gvisor = value.get("gvisor")?;
+    let key = match arch {
+        Arch::Aarch64 => "aarch64",
+        Arch::X86_64 => "x86_64",
+    };
+    let text = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_str).map(str::to_owned);
+    let pin = gvisor.get(key)?;
+    let (version, location, digest) = (text(gvisor, "version")?, text(pin, "location")?, text(pin, "digest")?);
+    // The same checks an image pin gets.
+    ImagePin::new(location.clone(), digest.clone(), arch).ok()?;
+    let version_ok = !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    version_ok.then_some(GvisorPin { version, location, digest })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,6 +62,16 @@ mod tests {
             assert!(parsed.location.starts_with("https://"), "{name}: a pin is fetched over https");
         }
         assert_eq!(all().len(), images.len(), "a pin failed to load");
+    }
+
+    #[test]
+    fn gvisor_is_pinned_for_the_default_images_arch_by_version_and_sha256() {
+        let pin = gvisor(Arch::Aarch64).unwrap();
+        assert!(pin.location.starts_with("https://storage.googleapis.com/gvisor/releases/release/"), "{pin:?}");
+        assert!(pin.location.contains(&format!("/{}/aarch64/", pin.version)), "{pin:?}");
+        assert_eq!(pin.digest.len(), "sha256:".len() + 64);
+        assert_eq!(gvisor(image(DEFAULT_IMAGE).unwrap().arch).as_ref(), Some(&pin));
+        assert!(gvisor(Arch::X86_64).is_none());
     }
 
     #[test]

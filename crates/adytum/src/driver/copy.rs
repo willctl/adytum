@@ -12,6 +12,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::exec::{tail, Command, Output, Runner};
 use crate::Error;
 
+/// The most a copy out of a cell carries; more is refused, so a cell
+/// cannot fill this machine's disk through one.
+pub const MAX_COPY: u64 = 8 * 1024 * 1024 * 1024;
+
+pub(crate) fn too_big() -> Error {
+    Error::Unsupported { what: format!("copying more than {} GiB out of a cell", MAX_COPY / (1024 * 1024 * 1024)) }
+}
+
 pub(crate) fn absolute(host: &Path) -> Result<&Path, Error> {
     if host.is_absolute() {
         Ok(host)
@@ -172,6 +180,10 @@ pub(crate) async fn fetch(ch: &Channel<'_>, guest: &str, host: &Path) -> Result<
 
 #[cfg(feature = "container")]
 async fn pump<W: AsyncWrite + Unpin>(from: &mut (impl AsyncRead + Unpin), to: &mut W) -> Result<(), Error> {
-    tokio::io::copy(from, to).await.map_err(|source| Error::Io { what: "carry the copy out of the cell", source })?;
+    use tokio::io::AsyncReadExt as _;
+    let carried = tokio::io::copy(&mut from.take(MAX_COPY + 1), to).await.map_err(|source| Error::Io { what: "carry the copy out of the cell", source })?;
+    if carried > MAX_COPY {
+        return Err(too_big());
+    }
     to.shutdown().await.map_err(|source| Error::Io { what: "finish the copy out of the cell", source })
 }

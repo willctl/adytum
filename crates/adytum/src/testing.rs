@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncWrite, DuplexStream};
 
 use crate::exec::{Command, Duplex, DuplexControl, Output, Runner};
-use crate::{CellName, CellSpec, CellState, Driver, Drivers, Error, ExecOpts, GuestUser, Host, KindName, Listed};
+use crate::{CellId, CellName, CellSpec, CellState, Driver, Drivers, Error, ExecOpts, GuestUser, Host, KindName, Listed};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -211,6 +211,7 @@ type StreamAnswer = Arc<Mutex<Option<Box<dyn FnMut(&[String]) -> Result<Duplex, 
 struct FakeState {
     cells: BTreeMap<CellName, CellState>,
     specs: BTreeMap<CellName, CellSpec>,
+    ids: BTreeMap<CellName, CellId>,
     faults: Vec<(Op, Leaves)>,
     list_faults: Vec<Option<CellName>>,
     calls: Vec<DriverCall>,
@@ -402,10 +403,11 @@ fn copy(from: &Path, to: &Path) -> Result<(), Error> {
 
 #[async_trait]
 impl Driver for FakeDriver {
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error> {
+    async fn create(&self, spec: &CellSpec, id: &CellId) -> Result<(), Error> {
         self.step(Op::Create, &spec.name, |st| {
             st.cells.insert(spec.name.clone(), CellState::Stopped);
             st.specs.insert(spec.name.clone(), spec.clone());
+            st.ids.insert(spec.name.clone(), *id);
             Ok(())
         })
     }
@@ -452,21 +454,27 @@ impl Driver for FakeDriver {
         })
     }
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error> {
+    /// A cell made with another id is not this one, and is left alone.
+    async fn remove(&self, name: &CellName, id: &CellId) -> Result<(), Error> {
         self.step(Op::Remove, name, |st| {
+            if st.ids.get(name).is_some_and(|theirs| theirs != id) {
+                return Err(Error::NotFound { name: name.to_string() });
+            }
             for gone in FakeDriver::inside(st, name).into_iter().chain([name.clone()]) {
                 st.cells.remove(&gone);
                 st.specs.remove(&gone);
+                st.ids.remove(&gone);
             }
             Ok(())
         })
     }
 
-    async fn clone_cell(&self, from: &CellName, to: &CellSpec) -> Result<(), Error> {
+    async fn clone_cell(&self, from: &CellName, to: &CellSpec, id: &CellId) -> Result<(), Error> {
         self.step(Op::Clone, &to.name, |st| match st.cells.get(from) {
             Some(CellState::Stopped) => {
                 st.cells.insert(to.name.clone(), CellState::Stopped);
                 st.specs.insert(to.name.clone(), to.clone());
+                st.ids.insert(to.name.clone(), *id);
                 Ok(())
             }
             Some(_) => Err(Error::Unsupported { what: format!("cloning {from} while it is not stopped") }),
@@ -482,7 +490,7 @@ impl Driver for FakeDriver {
             return Err(Error::Tool { what: "the fake driver's list".to_owned(), status: Some(1), stderr: "the daemon is down".to_owned() });
         }
         let here = |name: &CellName| st.specs.get(name).and_then(|s| s.parent.as_ref()) == self.host.as_ref();
-        Ok(st.cells.iter().filter(|(name, _)| here(name)).map(|(name, state)| Listed { name: name.clone(), state: *state }).collect())
+        Ok(st.cells.iter().filter(|(name, _)| here(name)).map(|(name, state)| Listed { name: name.clone(), state: *state, id: st.ids.get(name).copied() }).collect())
     }
 }
 

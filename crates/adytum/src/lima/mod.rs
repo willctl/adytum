@@ -3,7 +3,7 @@ mod network;
 mod pins;
 mod template;
 
-pub use pins::{image, image_names, DEFAULT_IMAGE};
+pub use pins::{gvisor, image, image_names, GvisorPin, DEFAULT_IMAGE};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::copy::{self, absolute, Channel};
 use crate::exec::{tail, Command, Duplex, Output, Runner, SystemRunner};
-use crate::{check_guest_path, command_line, CellName, CellSpec, CellState, Driver, Error, ExecOpts, GuestUser, Listed};
+use crate::{check_guest_path, command_line, CellId, CellName, CellSpec, CellState, Driver, Error, ExecOpts, GuestUser, Listed};
 use async_trait::async_trait;
 
 /// A unix socket path on macOS holds 104 bytes, its closing NUL included.
@@ -138,6 +138,51 @@ impl Lima {
         Ok(self.guest_shell(name, full))
     }
 
+    /// Lima reports a start as done even when the boot script failed, so a
+    /// cell without its ready file is stopped again, with the log's end as
+    /// the reason.
+    async fn check_ready(&self, name: &CellName) -> Result<(), Error> {
+        let probe = self.shell_command(name, &["test".to_owned(), "-e".to_owned(), guest::READY.to_owned()], &[], false)?.deadline(QUICK_DEADLINE);
+        let probe = self.run(probe, "limactl shell").await?;
+        match probe.status {
+            Some(0) => Ok(()),
+            Some(1) => {
+                let log = ["tail", "-n", "20", "/var/log/cloud-init-output.log"].map(str::to_owned);
+                let log = self.run(self.shell_command(name, &log, &[], true)?.deadline(QUICK_DEADLINE), "limactl shell").await.map(|o| o.stdout_lossy()).unwrap_or_default();
+                let _ = self.run(self.limactl().args(["stop", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE), "limactl stop").await;
+                Err(Error::Tool {
+                    what: "the cell's boot script".to_owned(),
+                    status: Some(1),
+                    stderr: format!("The cell was stopped again. The end of its boot log: {}", tail(&log)),
+                })
+            }
+            _ => Err(tool_failure("limactl shell", Some(name), &probe)),
+        }
+    }
+
+    /// limactl copy follows links and reads what it is given to the end, so
+    /// a FIFO, a device or too much is refused before it starts. The cell
+    /// could change what it has between this look and the copy; the copy's
+    /// deadline still bounds it.
+    async fn check_copy_size(&self, name: &CellName, guest: &str) -> Result<(), Error> {
+        let argv = ["find", "-L", guest, "-type", "f", "-printf", "%s\\n", "-o", "-type", "d", "-o", "-printf", "special\\n", "-quit"].map(str::to_owned);
+        let out = self.run(self.shell_command(name, &argv, &[], true)?.deadline(QUICK_DEADLINE), "find in the cell").await?;
+        if !out.success() {
+            return Err(tool_failure("find in the cell", Some(name), &out));
+        }
+        let mut total: u64 = 0;
+        for line in out.stdout_lossy().lines() {
+            if line == "special" {
+                return Err(Error::Unsupported { what: "copying a FIFO, a socket or a device out of a cell".to_owned() });
+            }
+            total = total.saturating_add(line.trim().parse::<u64>().unwrap_or(0));
+            if total > copy::MAX_COPY {
+                return Err(copy::too_big());
+            }
+        }
+        Ok(())
+    }
+
     fn guest_shell(&self, name: &CellName, full: Vec<String>) -> Command {
         self.limactl().args(["shell", "--workdir=/"]).arg(name.as_str()).arg("--").args(full)
     }
@@ -145,11 +190,16 @@ impl Lima {
 
 fn tool_failure(what: &str, name: Option<&CellName>, out: &Output) -> Error {
     let stderr = out.stderr_lossy();
-    let missing = stderr.contains("does not exist") || (stderr.contains("no such file or directory") && stderr.contains("lima.yaml"));
+    let missing = name.is_some_and(|n| instance_missing(&stderr, n)) || (stderr.contains("no such file or directory") && stderr.contains("lima.yaml"));
     match name {
         Some(name) if missing => Error::NotFound { name: name.to_string() },
         _ => Error::Tool { what: what.to_owned(), status: out.status, stderr: tail(&stderr) },
     }
+}
+
+/// limactl's own words, such as ``instance `adytum-a` does not exist``.
+fn instance_missing(stderr: &str, name: &CellName) -> bool {
+    stderr.contains(&format!("instance `{name}` does not exist"))
 }
 
 fn state_of(status: &str) -> CellState {
@@ -162,7 +212,8 @@ fn state_of(status: &str) -> CellState {
 
 #[async_trait]
 impl Driver for Lima {
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error> {
+    /// Lima cannot carry the id on an instance; its folder is Adytum's own.
+    async fn create(&self, spec: &CellSpec, _id: &CellId) -> Result<(), Error> {
         self.check_socket_path(&spec.name)?;
         let text = template::render(spec)?;
         let file = self.home.join("_templates").join(format!("{}.yaml", spec.name));
@@ -184,7 +235,7 @@ impl Driver for Lima {
         let start = || self.limactl().arg("start").arg("--tty=false").arg(name.as_str()).deadline(START_DEADLINE);
         let first = self.run(start(), "limactl start").await?;
         if first.success() {
-            return Ok(());
+            return self.check_ready(name).await;
         }
         // Under load Lima's host agent can miss its 5 s start-up window; the VM never came up.
         if !first.stderr_lossy().contains("did not start up in") {
@@ -193,7 +244,7 @@ impl Driver for Lima {
         let _ = self.run(self.limactl().args(["stop", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE), "limactl stop").await;
         let again = self.run(start(), "limactl start").await?;
         if again.success() {
-            return Ok(());
+            return self.check_ready(name).await;
         }
         Err(Error::Tool { what: "limactl start (tried twice: Lima's host agent did not start up)".to_owned(), status: again.status, stderr: tail(&again.stderr_lossy()) })
     }
@@ -207,7 +258,8 @@ impl Driver for Lima {
             cmd = cmd.deadline(deadline);
         }
         let out = self.runner.run(&cmd).await?;
-        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
+        // Only limactl's own words: a command in the cell may say "does not exist" too.
+        if !out.success() && instance_missing(&out.stderr_lossy(), name) {
             return Err(Error::NotFound { name: name.to_string() });
         }
         Ok(out)
@@ -248,6 +300,7 @@ impl Driver for Lima {
             Some(1) => false,
             _ => return Err(tool_failure("limactl shell", Some(name), &probe)),
         };
+        self.check_copy_size(name, guest).await?;
         let mut cmd = self.limactl().arg("copy").arg("--tty=false");
         if is_dir {
             cmd = cmd.arg("-r");
@@ -262,7 +315,7 @@ impl Driver for Lima {
         self.run_ok(cmd, "limactl stop", Some(name)).await.map(drop)
     }
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error> {
+    async fn remove(&self, name: &CellName, _id: &CellId) -> Result<(), Error> {
         let networks = self.networks_of(name);
         let cmd = self.limactl().args(["delete", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE);
         self.run_ok(cmd, "limactl delete", Some(name)).await?;
@@ -270,7 +323,7 @@ impl Driver for Lima {
         Ok(())
     }
 
-    async fn clone_cell(&self, from: &CellName, to: &CellSpec) -> Result<(), Error> {
+    async fn clone_cell(&self, from: &CellName, to: &CellSpec, _id: &CellId) -> Result<(), Error> {
         self.check_socket_path(&to.name)?;
         let mut edits = template::clone_edits(to)?;
         if to.network.is_none() && !self.networks_of(from).is_empty() {
@@ -311,7 +364,7 @@ impl Driver for Lima {
                 serde_json::from_str(line).map_err(|e| Error::Tool { what: "limactl list".to_owned(), status: out.status, stderr: format!("its output was not JSON: {e}") })?;
             let (Some(name), Some(status)) = (value.get("name").and_then(|v| v.as_str()), value.get("status").and_then(|v| v.as_str())) else { continue };
             if let Ok(name) = name.parse::<CellName>() {
-                cells.push(Listed { name, state: state_of(status) });
+                cells.push(Listed { name, state: state_of(status), id: None });
             }
         }
         Ok(cells)

@@ -226,6 +226,16 @@ fn containers_in_a_lima_cell_from_create_to_rm() {
     let tree = env.text(&["ls"]);
     assert!(tree.contains(&format!("{vm}  running  wall_nest  lima\n  {open}  running  wall_nest  container\n  {sealed}  running")), "{tree}");
 
+    // Both run under gVisor: its kernel answers, not the Lima cell's.
+    let vm_kernel = env.exec(&vm, &["uname", "-r"])["stdout"].as_str().unwrap().to_owned();
+    for c in [&sealed, &open] {
+        let dmesg = env.exec(c, &["dmesg"]);
+        assert!(dmesg["stdout"].as_str().unwrap().contains("gVisor"), "{c} is not under gVisor: {dmesg}");
+        let kernel = env.exec(c, &["uname", "-r"])["stdout"].as_str().unwrap().to_owned();
+        assert_ne!(kernel, vm_kernel, "{c} shares the Lima cell's kernel");
+        println!("  {c}: kernel {} (the Lima cell's is {})", kernel.trim(), vm_kernel.trim());
+    }
+
     // The container's user: 1000, with no capability at all, and no way up.
     let id = env.exec(&sealed, &["id", "-u"]);
     assert_eq!(id["stdout"], "1000\n", "{id}");
@@ -238,7 +248,10 @@ fn containers_in_a_lima_cell_from_create_to_rm() {
     // the Lima cell's way to it can be reached.
     let (port, reached) = host_listener();
     step("sealed: no network, no host", || {
-        assert_eq!(env.exec(&sealed, &["ls", "/sys/class/net"])["stdout"], "lo\n");
+        let devices = env.exec(&sealed, &["cat", "/proc/net/dev"]);
+        let names: Vec<&str> = devices["stdout"].as_str().unwrap().lines().filter_map(|l| l.split_once(':').map(|(n, _)| n.trim())).collect();
+        // gVisor lists not even a loopback for a container with no network.
+        assert!(names.iter().all(|n| *n == "lo"), "{devices}");
         for target in ["192.168.5.2", "host.lima.internal", "127.0.0.1"] {
             let url = format!("http://{target}:{port}/");
             assert_ne!(status(&env.exec(&sealed, &["wget", "-q", "-T", "3", "-O", "/dev/null", &url])), 0, "the sealed container reached {url}");

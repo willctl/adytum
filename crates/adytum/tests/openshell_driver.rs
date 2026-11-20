@@ -13,6 +13,8 @@ use adytum::{Driver, Error, ExecOpts};
 
 type Res = Result<(), Box<dyn std::error::Error>>;
 
+const ID: adytum::CellId = adytum::CellId::from_bytes([7; 16]);
+
 const NAME: &str = "adytum-test-golden";
 
 fn name() -> CellName {
@@ -62,15 +64,15 @@ async fn a_lifecycle_asks_openshell_for_each_step() -> Res {
     ]));
     let d = driver(&fake);
     assert_eq!(d.list().await?.len(), 0);
-    d.create(&spec()).await?;
+    d.create(&spec(), &ID).await?;
     d.start(&name()).await?;
     let listed = d.list().await?;
     assert_eq!((listed.len(), listed[0].name.as_str(), listed[0].state), (1, NAME, CellState::Running), "a sandbox of someone else's is left out");
     let opts = ExecOpts { env: vec![("A".into(), "1".into())], stdin: Some(b"in".to_vec()), deadline: Some(std::time::Duration::from_secs(20)), root: false };
     assert_eq!(d.exec(&name(), &["echo".into(), "hi there".into()], opts).await?.stdout_lossy(), "hi there\n");
     d.copy_in(&name(), Path::new("/tmp/src"), "/workspace", None).await?;
-    d.remove(&name()).await?;
-    d.remove(&name()).await?;
+    d.remove(&name(), &ID).await?;
+    d.remove(&name(), &ID).await?;
     let a = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
     assert_eq!(
         fake.argv(),
@@ -96,19 +98,19 @@ async fn what_openshell_cannot_do_is_refused_before_any_command() -> Res {
     let refused = |r: Result<(), Error>| matches!(r, Err(Error::Unsupported { .. }));
     assert!(refused(d.stop(&name()).await));
     assert!(refused(d.copy_out(&name(), "/a", Path::new("/tmp/a")).await));
-    assert!(refused(d.clone_cell(&name(), &spec()).await));
+    assert!(refused(d.clone_cell(&name(), &spec(), &ID).await));
     for bad in [
         CellSpec { ports: vec![adytum::Port { guest: 1, host: 2, bind: [127, 0, 0, 1].into() }], ..spec() },
         CellSpec { mounts: vec![adytum::Mount { source: "/tmp".into(), target: "/t".into(), writable: false }], ..spec() },
         CellSpec { clone_from: Some(name()), ..spec() },
     ] {
-        assert!(refused(d.create(&bad).await));
+        assert!(refused(d.create(&bad, &ID).await));
     }
     // A name past OpenShell's 19 characters, and no image to make it from.
     let long = CellSpec { name: "adytum-test-golden-long".parse()?, ..spec() };
-    assert!(matches!(d.create(&long).await, Err(Error::Invalid { .. })));
+    assert!(matches!(d.create(&long, &ID).await, Err(Error::Invalid { .. })));
     let bare = OpenShell::new(fake.clone(), Profile::Native, Host::new(false, None));
-    assert!(refused(bare.create(&spec()).await));
+    assert!(refused(bare.create(&spec(), &ID).await));
     assert!(matches!(d.start(&"adytum-nope".parse()?).await, Err(Error::NotFound { .. })), "a sandbox OpenShell does not know");
     Ok(())
 }
