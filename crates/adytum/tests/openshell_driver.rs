@@ -27,7 +27,6 @@ fn spec() -> CellSpec {
         wall: "wall_test".parse().expect("a valid wall"),
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: None,
@@ -102,7 +101,6 @@ async fn what_openshell_cannot_do_is_refused_before_any_command() -> Res {
         CellSpec { ports: vec![adytum::Port { guest: 1, host: 2, bind: [127, 0, 0, 1].into() }], ..spec() },
         CellSpec { mounts: vec![adytum::Mount { source: "/tmp".into(), target: "/t".into(), writable: false }], ..spec() },
         CellSpec { clone_from: Some(name()), ..spec() },
-        CellSpec { automation_port: Some(9222), ..spec() },
     ] {
         assert!(refused(d.create(&bad).await));
     }

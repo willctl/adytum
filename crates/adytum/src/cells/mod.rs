@@ -147,15 +147,6 @@ impl Cells {
         removed
     }
 
-    /// A held cell is not cloned.
-    pub fn hold(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.ledger.hold(name, eidolon)
-    }
-
-    pub fn release(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.ledger.release(name, eidolon)
-    }
-
     fn settle(&self, op: ledger::OpId, result: Result<(), Error>) -> Result<(), Error> {
         let outcome = result.as_ref().map_or_else(|e| Outcome::Failed(e.to_string()), |()| Outcome::Done);
         let settled = self.ledger.settle(op, outcome);

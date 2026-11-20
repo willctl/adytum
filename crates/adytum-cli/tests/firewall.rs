@@ -175,7 +175,6 @@ fn spec(name: &str) -> CellSpec {
         wall: "wall_fw".parse().unwrap(),
         resources: Resources { cpus: 1, memory_mib: 1024, ..Resources::default() },
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: None,

@@ -111,24 +111,14 @@ async fn creating_a_name_that_exists_is_refused_by_policy() {
 #[tokio::test]
 async fn the_spec_a_create_builds_has_localhost_ports_and_no_mounts() {
     let rig = Rig::new("spec");
-    let r = rig.go("create adytum-test-p --sealed --cpus 3 --memory 3072 --port 18080:80 --automation-port 9222").await;
+    let r = rig.go("create adytum-test-p --sealed --cpus 3 --memory 3072 --port 18080:80").await;
     assert_eq!(r.code, 0, "{}", r.err);
     let spec = rig.driver.spec(&"adytum-test-p".parse().unwrap()).unwrap();
     assert_eq!((spec.resources.cpus, spec.resources.memory_mib), (3, 3072));
     assert_eq!(spec.ports.len(), 1);
     assert_eq!((spec.ports[0].host, spec.ports[0].guest, spec.ports[0].bind.to_string().as_str()), (18080, 80, "127.0.0.1"));
-    assert_eq!(spec.automation_port, Some(9222));
     assert!(spec.mounts.is_empty() && spec.sealed);
     assert_eq!(spec.wall.as_str(), "wall_default");
-}
-
-#[tokio::test]
-async fn publishing_the_automation_port_is_refused() {
-    let rig = Rig::new("auto");
-    let r = rig.go("create adytum-test-p --port 9222:9222 --automation-port 9222 --json").await;
-    assert_eq!(r.code, 1);
-    assert_eq!(r.json()["error"]["code"], "automation_port_published");
-    assert!(rig.calls().iter().all(|c| !c.starts_with("create")));
 }
 
 #[tokio::test]
@@ -274,18 +264,9 @@ async fn a_clone_across_walls_is_refused_as_wall_clone_before_the_driver_clones(
 }
 
 #[tokio::test]
-async fn a_clone_of_a_cell_holding_an_eidolon_is_refused_until_it_is_released() {
-    let rig = Rig::new("holdclone");
+async fn a_clone_keeps_the_wall_and_publishes_nothing_of_the_source() {
+    let rig = Rig::new("clonewall");
     assert_eq!(rig.go("create adytum-test-a --wall wall_a").await.code, 0);
-    let r = rig.go("hold adytum-test-a eid_1 --json").await;
-    assert_eq!((r.code, r.json()["held"].as_bool()), (0, Some(true)), "{}", r.err);
-
-    let r = rig.go("clone adytum-test-a adytum-test-b --json").await;
-    assert_eq!(r.code, 1);
-    assert_eq!(r.json()["error"]["code"], "clone_open_eidolon");
-    assert!(rig.calls().iter().all(|c| !c.starts_with("clone")));
-
-    assert_eq!(rig.go("release adytum-test-a eid_1").await.code, 0);
     let r = rig.go("clone adytum-test-a adytum-test-b --json").await;
     assert_eq!(r.code, 0, "{}", r.out);
     assert_eq!((field(&r.json(), &["state"]).as_str(), field(&r.json(), &["wall"]).as_str()), (Some("stopped"), Some("wall_a")));
@@ -296,16 +277,6 @@ async fn a_clone_of_a_cell_holding_an_eidolon_is_refused_until_it_is_released() 
     let spec = spec_named(&rig, "adytum-test-b");
     assert_eq!(spec.clone_from.as_ref().map(CellName::as_str), Some("adytum-test-a"));
     assert_eq!(spec.ports.len(), 0);
-}
-
-#[tokio::test]
-async fn hold_and_release_need_a_recorded_cell_and_a_plain_id() {
-    let rig = Rig::new("hold");
-    let r = rig.go("hold adytum-test-nope eid_1 --json").await;
-    assert_eq!(r.json()["error"]["code"], "not_recorded");
-    assert_eq!(rig.go("hold adytum-test-nope bad/id").await.code, 2);
-    let r = rig.go("hold pane eid_1 --json").await;
-    assert_eq!(r.json()["error"]["code"], "name_not_ours");
 }
 
 #[tokio::test]

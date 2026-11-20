@@ -25,7 +25,6 @@ fn spec() -> CellSpec {
         wall: "wall_test".parse().unwrap(),
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: None,
@@ -228,7 +227,7 @@ async fn a_copy_with_an_owner_is_made_and_unpacked_by_that_user() {
     std::fs::write(&file, b"f").unwrap();
     let root: adytum::GuestUser = "root".parse().unwrap();
     lima.copy_in(&name(), &tree, "/opt/tree", Some(&root)).await.unwrap();
-    lima.copy_in(&name(), &file, "/home/eidolon/f", Some(&"eidolon".parse().unwrap())).await.unwrap();
+    lima.copy_in(&name(), &file, "/home/builder/f", Some(&"builder".parse().unwrap())).await.unwrap();
     let as_user = |user: &str, rest: &[&str]| shell(&[&["sudo", "-n", "-u", user, "-H", "--"][..], rest].concat());
     let guest_calls: Vec<Vec<String>> = fake.argv().into_iter().filter(|a| a[0] == "limactl").collect();
     assert_eq!(
@@ -236,8 +235,8 @@ async fn a_copy_with_an_owner_is_made_and_unpacked_by_that_user() {
         [
             as_user("root", &["mkdir", "-p", "--", "/opt/tree"]),
             as_user("root", &["tar", "-x", "-f", "-", "--no-same-owner", "--no-same-permissions", "-C", "/opt/tree"]),
-            as_user("eidolon", &["mkdir", "-p", "--", "/home/eidolon"]),
-            as_user("eidolon", &["dd", "of=/home/eidolon/f", "bs=1M", "status=none"]),
+            as_user("builder", &["mkdir", "-p", "--", "/home/builder"]),
+            as_user("builder", &["dd", "of=/home/builder/f", "bs=1M", "status=none"]),
         ]
     );
 }

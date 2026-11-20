@@ -180,7 +180,6 @@ mod tests {
             wall: "wall_a".parse::<Wall>().unwrap(),
             resources: Resources::default(),
             ports: vec![],
-            automation_port: None,
             mounts: vec![],
             sealed,
             network: None,
@@ -236,17 +235,6 @@ mod tests {
         s.ports.push(Port { guest: 80, host: 8080, bind: "0.0.0.0".parse().unwrap() });
         let Err(Error::Refused(r)) = render(&s) else { panic!("not refused") };
         assert_eq!(r.code, crate::RefusalCode::PortNotLocalhost);
-    }
-
-    #[test]
-    fn the_automation_port_is_never_forwarded() {
-        let mut s = spec(true);
-        s.automation_port = Some(9222);
-        let text = render(&s).unwrap();
-        assert!(!text.contains("9222"));
-        s.ports.push(Port { guest: 9222, host: 9222, bind: "127.0.0.1".parse().unwrap() });
-        let Err(Error::Refused(r)) = render(&s) else { panic!("not refused") };
-        assert_eq!(r.code, crate::RefusalCode::AutomationPortPublished);
     }
 
     #[test]

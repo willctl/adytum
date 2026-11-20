@@ -8,7 +8,6 @@ use crate::{Cell, CellName, CellSpec, Refusal, RefusalCode};
 /// anything.
 pub fn check_spec(spec: &CellSpec) -> Result<(), Refusal> {
     ports_on_localhost(spec)?;
-    automation_port_kept_inside(spec)?;
     sealed_has_no_mounts(spec)
 }
 
@@ -18,8 +17,7 @@ pub fn check_create(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
     name_free(spec, cells)?;
     walls_share_no_network(spec, cells)?;
     walls_share_no_mount(spec, cells)?;
-    walls_share_no_clone_source(spec, cells)?;
-    no_clone_of_open_eidolon(spec, cells)
+    walls_share_no_clone_source(spec, cells)
 }
 
 fn find<'a>(cells: &'a [Cell], name: &CellName) -> Option<&'a Cell> {
@@ -41,17 +39,6 @@ fn ports_on_localhost(spec: &CellSpec) -> Result<(), Refusal> {
             format!("Port {} would be published on {}, which other machines can reach.", p.guest, p.bind),
             "Publish it on 127.0.0.1.",
         )),
-    }
-}
-
-fn automation_port_kept_inside(spec: &CellSpec) -> Result<(), Refusal> {
-    match spec.automation_port {
-        Some(auto) if spec.ports.iter().any(|p| p.guest == auto) => Err(Refusal::new(
-            RefusalCode::AutomationPortPublished,
-            format!("The automation port {auto} would be published to the host."),
-            "Remove it from the ports; the host reaches it through the exec channel.",
-        )),
-        _ => Ok(()),
     }
 }
 
@@ -131,17 +118,6 @@ fn walls_share_no_clone_source(spec: &CellSpec, cells: &[Cell]) -> Result<(), Re
             format!("{} is behind another wall and cannot be cloned.", c.spec.name),
             "Clone a cell behind the same wall, or start from the image.",
         )),
-    }
-}
-
-fn no_clone_of_open_eidolon(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
-    match spec.clone_from.as_ref().and_then(|n| find(cells, n)) {
-        Some(c) if !c.holds.is_empty() => Err(Refusal::new(
-            RefusalCode::CloneOpenEidolon,
-            format!("{} holds an open eidolon; a clone would be a second live copy.", c.spec.name),
-            "Seal the eidolon first, or clone another cell.",
-        )),
-        _ => Ok(()),
     }
 }
 

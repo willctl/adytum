@@ -21,12 +21,7 @@ pub(crate) const TABLES: &[&str] = &[
         settled_at INTEGER,
         outcome TEXT
     )",
-    "CREATE INDEX ops_open ON ops (id) WHERE settled_at IS NULL",
-    "CREATE TABLE holds (
-        name TEXT NOT NULL,
-        eidolon TEXT NOT NULL,
-        PRIMARY KEY (name, eidolon)
-    ) WITHOUT ROWID",
+    "CREATE INDEX ops_open ON ops (id) WHERE settled_at IS NULL"
 ];
 
 /// The first 31 bits of the tables' SHA-256, never 0, which is SQLite's

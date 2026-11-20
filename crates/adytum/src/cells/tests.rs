@@ -26,7 +26,6 @@ fn spec(n: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
         wall: "wall_a".parse()?,
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: false,
         network: None,
@@ -250,24 +249,6 @@ async fn a_refusal_comes_before_any_intent() -> T {
     bad.mounts.push(crate::Mount { source: "/tmp".into(), target: "/mnt".into(), writable: false });
     assert!(matches!(cells.create(&bad).await, Err(Error::Refused(_))));
     assert!(cells.ledger.open_ops()?.is_empty() && cells.list()?.is_empty() && driver.cells().is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_cell_that_holds_an_eidolon_cannot_be_cloned() -> T {
-    let driver = Arc::new(FakeDriver::new());
-    let cells = Cells::memory(driver.clone())?;
-    let base = spec("adytum-test-h")?;
-    cells.create(&base).await?;
-    cells.hold(&base.name, "eid_one")?;
-    let mut copy = spec("adytum-test-h2")?;
-    copy.clone_from = Some(base.name.clone());
-    match cells.create(&copy).await {
-        Err(Error::Refused(r)) => assert_eq!(r.code, RefusalCode::CloneOpenEidolon),
-        other => panic!("{other:?}"),
-    }
-    cells.release(&base.name, "eid_one")?;
-    cells.create(&copy).await?;
     Ok(())
 }
 

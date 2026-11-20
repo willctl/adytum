@@ -134,9 +134,6 @@ impl Driver for OpenShell {
         if spec.clone_from.is_some() {
             return Err(refuse("cloning an OpenShell sandbox"));
         }
-        if spec.automation_port.is_some() {
-            return Err(refuse("an automation port in an OpenShell sandbox"));
-        }
         let Some(extras) = &self.extras else {
             return Err(refuse("a sandbox without a container image (call with_extras first)"));
         };

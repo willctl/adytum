@@ -6,7 +6,7 @@ Adytum keeps cells on one machine apart from the host and from each other. This 
 
 One library crate, `adytum`, and one binary crate, `adytum-cli`. In the library:
 
-- `Cells` pairs a `Driver` with the ledger. It is the only way to create, clone, start, stop, remove, hold and reconcile a cell.
+- `Cells` pairs a `Driver` with the ledger. It is the only way to create, clone, start, stop, remove and reconcile a cell.
 - A `Driver` is one kind of cell. `lima::Lima` is the default; `openshell::OpenShell` is behind the `openshell` feature.
 - `policy::check_create` holds every rule as a pure function over a spec and the recorded cells.
 - `exec` is the only place a process starts.
@@ -39,7 +39,7 @@ Lima logs in as an admin user with passwordless sudo. Every command runs as `cel
 
 ## No mounts in a sealed cell
 
-Lima mounts the host's home folder unless the template lists mounts. A sealed cell's template always says `mounts: []`, and the rules refuse a sealed spec with a mount before anything is written. The template also turns off what Lima would copy from the host: the user's name, the ssh agent, the ssh keys and the proxy variables. Ports are published on loopback only, and a cell's automation port is never published at all; the host reaches it through `Driver::stream`.
+Lima mounts the host's home folder unless the template lists mounts. A sealed cell's template always says `mounts: []`, and the rules refuse a sealed spec with a mount before anything is written. The template also turns off what Lima would copy from the host: the user's name, the ssh agent, the ssh keys and the proxy variables. Ports are published on loopback only.
 
 ## No shell
 

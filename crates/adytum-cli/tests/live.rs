@@ -10,7 +10,7 @@
 //! folder at the end, also when a step fails.
 //!
 //! Three scenarios: a sealed cell from create to rm, a cell with a published
-//! port, and a clone (with the eidolon-hold guard) and a kill test (`adytum
+//! port, a clone, and a kill test (`adytum
 //! create` killed with `kill -9` while Lima is making the instance, then the
 //! next command reconciles it away).
 
@@ -297,8 +297,8 @@ fn listed_names(env: &Env) -> Vec<String> {
     listed["cells"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_owned()).collect()
 }
 
-/// create, stop, clone into a second cell, start and use the clone; a held
-/// source refuses the next clone; release; remove both.
+/// create, stop, clone into a second cell, start and use the clone; a clone
+/// across walls is refused; remove both.
 fn clone_cells() {
     let env = new_env();
     let (src, copy, third) = (format!("adytum-test-live-{}", random_tag()), format!("adytum-test-live-{}", random_tag()), format!("adytum-test-live-{}", random_tag()));
@@ -324,15 +324,6 @@ fn clone_cells() {
     // A clone is its own cell: a change in it does not reach the source.
     assert_eq!(env.exec(&copy, &["rm", "/var/tmp/marker"])["status"], 0);
     assert_eq!(env.json(&["stop", &copy]).0, 0);
-
-    // A held source is not cloned, however many times it is asked.
-    assert_eq!(env.json(&["hold", &src, "eid_live"]).0, 0);
-    let (code, v) = step("clone while held", || env.json(&["clone", &src, &third]));
-    assert_eq!((code, v["error"]["code"].as_str()), (1, Some("clone_open_eidolon")), "{v}");
-    assert_eq!(listed_names(&env).len(), 2, "a refused clone left a cell");
-    assert!(!env.home.join("lima").join(&third).exists());
-    let (code, v) = env.json(&["release", &src, "eid_live"]);
-    assert_eq!((code, v["held"].as_bool()), (0, Some(false)), "{v}");
 
     // A clone across walls is refused as well.
     let (code, v) = env.json(&["clone", &src, &third, "--wall", "wall_other"]);
@@ -522,7 +513,6 @@ fn net_spec(name: &str, wall: &str, network: &str) -> adytum::CellSpec {
         wall: wall.parse().unwrap(),
         resources: adytum::Resources { cpus: 1, memory_mib: 1024, ..adytum::Resources::default() },
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: Some(network.parse().unwrap()),

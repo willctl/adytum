@@ -77,18 +77,6 @@ pub(crate) async fn execute(command: Command, ctx: &Context, out: &mut dyn Write
             let wall = wall.map(|w| w.parse::<Wall>().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))).transpose()?;
             clone(ctx, err, &from, to, wall, &ports).await
         }
-        Command::Hold { name, eidolon } => {
-            let name = name.parse::<CellName>()?;
-            let session = Session::open(ctx, err).await?;
-            session.cells.hold(&name, &eidolon)?;
-            Ok(session.done(json!({ "name": name, "eidolon": eidolon, "held": true }), format!("{name} holds {eidolon}")))
-        }
-        Command::Release { name, eidolon } => {
-            let name = name.parse::<CellName>()?;
-            let session = Session::open(ctx, err).await?;
-            session.cells.release(&name, &eidolon)?;
-            Ok(session.done(json!({ "name": name, "eidolon": eidolon, "held": false }), format!("{name} no longer holds {eidolon}")))
-        }
         Command::Exec { name, argv } => exec(ctx, &name, &argv, out, err, json).await,
         Command::Cp { src, dst, owner } => copy(ctx, err, &src, &dst, owner.as_deref()).await,
         Command::Ls => list(ctx, err).await,
@@ -122,7 +110,6 @@ fn spec_from(args: &CreateArgs, name: CellName) -> Result<CellSpec, Failure> {
         wall,
         resources,
         ports: loopback_ports(&args.ports),
-        automation_port: args.automation_port,
         mounts: Vec::new(),
         sealed: args.sealed,
         network: None,

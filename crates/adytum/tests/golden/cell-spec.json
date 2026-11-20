@@ -19,7 +19,6 @@
       "bind": "127.0.0.1"
     }
   ],
-  "automation_port": 9222,
   "mounts": [
     {
       "source": "/work/shared",

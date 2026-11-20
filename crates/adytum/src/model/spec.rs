@@ -102,8 +102,6 @@ pub struct CellSpec {
     pub wall: Wall,
     pub resources: Resources,
     pub ports: Vec<Port>,
-    /// The guest port of the browser's automation socket; never published.
-    pub automation_port: Option<u16>,
     pub mounts: Vec<Mount>,
     /// A sealed cell has nothing from the host.
     pub sealed: bool,
@@ -127,8 +125,6 @@ pub struct Cell {
     pub id: CellId,
     pub spec: CellSpec,
     pub state: CellState,
-    /// The open eidolons recorded as held in it. A held cell is not cloned.
-    pub holds: Vec<String>,
 }
 
 #[cfg(test)]

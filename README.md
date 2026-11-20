@@ -23,7 +23,6 @@ adytum cp ./site adytum-web:/home/cell/site
 adytum cp adytum-web:/home/cell/out.log ./out.log
 adytum cp --owner root ./unit adytum-web:/etc/systemd/system/web.service
 adytum clone adytum-web adytum-web2      # the source must be stopped
-adytum hold adytum-web eid_1             # a held cell is not cloned
 adytum ls
 adytum stop adytum-web && adytum rm adytum-web
 ```
@@ -52,7 +51,6 @@ async fn main() -> adytum::Result<()> {
         wall: "wall_demo".parse()?,
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: None,

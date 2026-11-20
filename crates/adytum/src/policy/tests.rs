@@ -18,7 +18,6 @@ fn spec(n: &str, wall: &str) -> CellSpec {
         wall: wall.parse().unwrap(),
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: false,
         network: None,
@@ -27,7 +26,7 @@ fn spec(n: &str, wall: &str) -> CellSpec {
 }
 
 fn cell(n: &str, wall: &str) -> Cell {
-    Cell { id: CellId::from_bytes([0; 16]), spec: spec(n, wall), state: CellState::Stopped, holds: vec![] }
+    Cell { id: CellId::from_bytes([0; 16]), spec: spec(n, wall), state: CellState::Stopped }
 }
 
 fn port(guest: u16, bind: IpAddr) -> Port {
@@ -57,22 +56,6 @@ fn ports_on_other_addresses_are_refused() {
 fn loopback_ports_pass() {
     let mut s = spec("adytum-a", "wall_a");
     s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into()), port(81, Ipv4Addr::new(127, 5, 5, 5).into()), port(82, Ipv6Addr::LOCALHOST.into())];
-    assert!(check_spec(&s).is_ok());
-}
-
-#[test]
-fn published_automation_port_is_refused_even_on_localhost() {
-    let mut s = spec("adytum-a", "wall_a");
-    s.automation_port = Some(9222);
-    s.ports = vec![port(9222, Ipv4Addr::LOCALHOST.into())];
-    assert_eq!(code(check_spec(&s)), RefusalCode::AutomationPortPublished);
-}
-
-#[test]
-fn automation_port_not_in_ports_passes() {
-    let mut s = spec("adytum-a", "wall_a");
-    s.automation_port = Some(9222);
-    s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into())];
     assert!(check_spec(&s).is_ok());
 }
 
@@ -189,16 +172,7 @@ fn cloning_within_a_wall_passes() {
 }
 
 #[test]
-fn cloning_a_cell_with_an_open_eidolon_is_refused() {
-    let mut s = spec("adytum-b", "wall_a");
-    s.clone_from = Some(name("adytum-a"));
-    let mut theirs = cell("adytum-a", "wall_a");
-    theirs.holds = vec!["eid_open".into()];
-    assert_eq!(code(check_create(&s, &[theirs])), RefusalCode::CloneOpenEidolon);
-}
-
-#[test]
-fn cloning_a_cell_without_one_passes() {
+fn cloning_from_the_same_wall_or_from_the_image_passes() {
     let mut s = spec("adytum-b", "wall_a");
     s.clone_from = Some(name("adytum-a"));
     assert!(check_create(&s, &[cell("adytum-a", "wall_a")]).is_ok());
@@ -252,7 +226,6 @@ proptest! {
         suffix in "[a-z0-9][a-z0-9-]{0,45}[a-z0-9]",
         wall in "[a-z0-9_-]{1,64}",
         ports in proptest::collection::vec((1u16..9000, any::<u8>()), 0..4),
-        automation in proptest::option::of(9000u16..9999),
         sealed in any::<bool>(),
     ) {
         let mut s = spec(&format!("adytum-{suffix}"), &format!("wall_{wall}"));
@@ -260,7 +233,6 @@ proptest! {
             .into_iter()
             .map(|(g, last)| port(g, Ipv4Addr::new(127, 0, 0, last).into()))
             .collect();
-        s.automation_port = automation;
         s.sealed = sealed;
         if !sealed {
             s.mounts = vec![mount("/work/a")];

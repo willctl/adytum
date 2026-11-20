@@ -219,7 +219,6 @@ impl Ledger {
                 Ok(())
             };
             let delete = || -> Result<(), Error> {
-                tx.execute("DELETE FROM holds WHERE name = ?1", [&name])?;
                 tx.execute("DELETE FROM cells WHERE name = ?1", [&name])?;
                 Ok(())
             };
@@ -243,7 +242,6 @@ impl Ledger {
 
     pub(crate) fn forget(&self, name: &CellName) -> Result<(), Error> {
         self.write(|tx| {
-            tx.execute("DELETE FROM holds WHERE name = ?1", [name.as_str()])?;
             tx.execute("DELETE FROM cells WHERE name = ?1", [name.as_str()])?;
             Ok(())
         })
@@ -251,36 +249,16 @@ impl Ledger {
 
     pub(crate) fn cells(&self) -> Result<Vec<Cell>, Error> {
         let guard = self.lock();
-        let mut holds = guard.prepare("SELECT eidolon FROM holds WHERE name = ?1 ORDER BY eidolon")?;
-        let mut stmt = guard.prepare("SELECT name, id, spec_json, state FROM cells ORDER BY name")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+        let mut stmt = guard.prepare("SELECT id, spec_json, state FROM cells ORDER BY name")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
         let mut out = Vec::new();
         for row in rows {
-            let (name, id, spec_json, state) = row?;
+            let (id, spec_json, state) = row?;
             let id = id.parse::<CellId>().map_err(|e| Error::Corrupt(e.to_string()))?;
             let spec = serde_json::from_str::<CellSpec>(&spec_json).map_err(|e| Error::Corrupt(e.to_string()))?;
-            let held = holds.query_map([&name], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
-            out.push(Cell { id, spec, state: enum_parse(&state)?, holds: held });
+            out.push(Cell { id, spec, state: enum_parse(&state)? });
         }
         Ok(out)
-    }
-
-    pub(crate) fn hold(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.write(|tx| {
-            let known: Option<i64> = tx.query_row("SELECT 1 FROM cells WHERE name = ?1", [name.as_str()], |r| r.get(0)).optional()?;
-            if known.is_none() {
-                return Err(Error::NotRecorded(name.clone()));
-            }
-            tx.execute("INSERT OR IGNORE INTO holds (name, eidolon) VALUES (?1, ?2)", params![name.as_str(), eidolon])?;
-            Ok(())
-        })
-    }
-
-    pub(crate) fn release(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.write(|tx| {
-            tx.execute("DELETE FROM holds WHERE name = ?1 AND eidolon = ?2", params![name.as_str(), eidolon])?;
-            Ok(())
-        })
     }
 
     pub(crate) fn open_ops(&self) -> Result<Vec<OpenOp>, Error> {

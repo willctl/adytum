@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn guest_user_is_a_plain_user_name() {
-        for ok in ["root", "cell", "eidolon", "_apt", "www-data", "u1", &"a".repeat(32)] {
+        for ok in ["root", "cell", "builder", "_apt", "www-data", "u1", &"a".repeat(32)] {
             assert!(ok.parse::<GuestUser>().is_ok(), "{ok:?}");
         }
         for bad in ["", "Root", "1user", "-u", "a b", "a:b", "a/b", "a.b", "user$", "../root", &"a".repeat(33)] {

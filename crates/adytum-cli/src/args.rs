@@ -28,7 +28,6 @@ pub struct CreateArgs {
     pub image: Option<String>,
     /// `(host, guest)`
     pub ports: Vec<(u16, u16)>,
-    pub automation_port: Option<u16>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,8 +39,6 @@ pub enum Command {
     Stop(String),
     Rm(String),
     Clone { from: String, to: String, wall: Option<String>, ports: Vec<(u16, u16)> },
-    Hold { name: String, eidolon: String },
-    Release { name: String, eidolon: String },
     Doctor,
     Exec { name: String, argv: Vec<String> },
     Cp { src: String, dst: String, owner: Option<String> },
@@ -60,15 +57,12 @@ adytum: cells on this machine
 Usage:
   adytum create <name> [--sealed] [--wall wall_x] [--cpus N] [--memory MiB]
                        [--image ubuntu-24.04] [--port host:guest]...
-                       [--automation-port N]
   adytum start <name>
   adytum stop <name>
   adytum rm <name>
   adytum clone <from> <to> [--wall wall_x] [--port host:guest]...
                                          (<from> must be stopped; the copy
                                           keeps its wall unless you give one)
-  adytum hold <name> <eidolon>           (record that the cell holds an open
-  adytum release <name> <eidolon>         eidolon, or no longer does)
   adytum exec <name> -- <command> [args...]
   adytum cp [--owner user] <source> <destination>
                                          (one side is <name>:<absolute path>;
@@ -84,7 +78,7 @@ Exit codes: 0 done, 1 refused or failed, 2 usage error.
 Cells are named adytum-<lowercase letters, digits, dashes>.
 ";
 
-const VALUE_FLAGS: [&str; 7] = ["wall", "cpus", "memory", "image", "port", "automation-port", "owner"];
+const VALUE_FLAGS: [&str; 6] = ["wall", "cpus", "memory", "image", "port", "owner"];
 
 #[derive(Default)]
 struct Raw {
@@ -147,15 +141,6 @@ pub fn wants_json(tokens: &[String]) -> bool {
     tokens.iter().take_while(|t| *t != "--").any(|t| t == "--json")
 }
 
-fn eidolon_id(text: &str) -> Result<String, Usage> {
-    let ok = !text.is_empty() && text.len() <= 128 && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    if ok {
-        Ok(text.to_owned())
-    } else {
-        Err(Usage::new(format!("{text:?} is not an eidolon id."), "Use letters, digits, - _ . : and at most 128 characters."))
-    }
-}
-
 fn one_name(command: &str, raw: &Raw) -> Result<String, Usage> {
     match raw.positional.as_slice() {
         [name] => Ok(name.clone()),
@@ -198,7 +183,6 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
                     "image" => args.image = Some(value.clone()),
                     "cpus" => args.cpus = Some(number(flag, value)?),
                     "memory" => args.memory_mib = Some(number(flag, value)?),
-                    "automation-port" => args.automation_port = Some(number(flag, value)?),
                     "port" => args.ports.push(port_pair(value)?),
                     other => return Err(Usage::new(format!("`adytum create` does not take --{other}."), "Run `adytum --help` to see which commands take which.")),
                 }
@@ -231,19 +215,6 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
                 }
             }
             Command::Clone { from: from.clone(), to: to.clone(), wall, ports }
-        }
-        "hold" | "release" => {
-            only_json(first, &raw)?;
-            let [name, eidolon] = raw.positional.as_slice() else {
-                return Err(Usage::new(format!("`adytum {first}` needs a cell name and an eidolon id."), format!("Write adytum {first} <name> <eidolon>.")));
-            };
-            let eidolon = eidolon_id(eidolon)?;
-            let name = name.clone();
-            if first == "hold" {
-                Command::Hold { name, eidolon }
-            } else {
-                Command::Release { name, eidolon }
-            }
         }
         "doctor" => {
             only_json("doctor", &raw)?;
@@ -297,13 +268,13 @@ mod tests {
     #[test]
     fn create_reads_every_option() {
         let parsed =
-            p("create adytum-a --sealed --wall wall_x --cpus 4 --memory=4096 --image ubuntu-24.04 --port 18080:80 --port 18443:443 --automation-port 9222 --json").unwrap();
+            p("create adytum-a --sealed --wall wall_x --cpus 4 --memory=4096 --image ubuntu-24.04 --port 18080:80 --port 18443:443 --json").unwrap();
         assert!(parsed.json);
         let Command::Create(a) = parsed.command else { panic!("not create") };
         assert_eq!(a.name, "adytum-a");
         assert!(a.sealed);
         assert_eq!(a.wall.as_deref(), Some("wall_x"));
-        assert_eq!((a.cpus, a.memory_mib, a.automation_port), (Some(4), Some(4096), Some(9222)));
+        assert_eq!((a.cpus, a.memory_mib), (Some(4), Some(4096)));
         assert_eq!(a.ports, [(18080, 80), (18443, 443)]);
     }
 
@@ -340,9 +311,6 @@ mod tests {
             "clone adytum-a",
             "clone adytum-a adytum-b --sealed",
             "clone adytum-a adytum-b --cpus 2",
-            "hold adytum-a",
-            "hold adytum-a bad/id",
-            "release adytum-a a b",
             "doctor extra",
         ] {
             let err = p(bad).unwrap_err();
@@ -351,11 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn clone_hold_release_and_doctor_read() {
+    fn clone_doctor_and_cp_read() {
         let Command::Clone { from, to, wall, ports } = p("clone adytum-a adytum-b --wall wall_x --port 1:2").unwrap().command else { panic!("not clone") };
         assert_eq!((from.as_str(), to.as_str(), wall.as_deref(), ports.as_slice()), ("adytum-a", "adytum-b", Some("wall_x"), &[(1, 2)][..]));
-        assert_eq!(p("hold adytum-a eid_1:x").unwrap().command, Command::Hold { name: "adytum-a".into(), eidolon: "eid_1:x".into() });
-        assert_eq!(p("release adytum-a e1 --json").unwrap().command, Command::Release { name: "adytum-a".into(), eidolon: "e1".into() });
         assert_eq!(p("doctor --json").unwrap().command, Command::Doctor);
         assert_eq!(p("cp --owner root ./a adytum-a:/opt/a").unwrap().command, Command::Cp { src: "./a".into(), dst: "adytum-a:/opt/a".into(), owner: Some("root".into()) });
     }
