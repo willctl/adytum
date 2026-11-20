@@ -14,11 +14,12 @@ cargo deny --locked check
 cargo shear
 ```
 
-The live tests need Lima and make real VMs, so they run only with `ADYTUM_LIVE=1`:
+The live tests need Lima and the internet, and make real VMs, so they run only with `ADYTUM_LIVE=1`:
 
 ```bash
 ADYTUM_LIVE=1 cargo test -p adytum-cli --test live -- --nocapture --test-threads=1
 ADYTUM_LIVE=1 cargo test -p adytum-cli --test firewall -- --nocapture --test-threads=1
+ADYTUM_LIVE=1 cargo test -p adytum-cli --test nest -- --nocapture --test-threads=1
 ```
 
 ## Rules
