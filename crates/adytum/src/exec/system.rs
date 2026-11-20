@@ -2,8 +2,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
+
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::exec::duplex::{Duplex, DuplexControl};
@@ -73,7 +78,19 @@ async fn stop(child: &mut Child, pgid: Option<u32>, grace: Duration) {
     let _ = child.wait().await;
 }
 
-fn spawn_reader<R>(mut stream: R) -> JoinHandle<Vec<u8>>
+/// What [`Runner::run`] keeps of stdout and of stderr each; a command that
+/// writes more is stopped, since its output is held in memory.
+pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
+/// Set by a reader that went past [`MAX_OUTPUT`]. The flag, not the notice,
+/// decides: a command whose pipe closed may exit before the notice is seen.
+#[derive(Default)]
+struct Over {
+    hit: AtomicBool,
+    notice: Notify,
+}
+
+fn spawn_reader<R>(mut stream: R, over: Arc<Over>) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -83,11 +100,32 @@ where
         loop {
             match stream.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
+                Ok(n) if all.len() + n > MAX_OUTPUT => {
+                    over.hit.store(true, Ordering::SeqCst);
+                    over.notice.notify_one();
+                    break;
+                }
                 Ok(n) => all.extend_from_slice(&buf[..n]),
             }
         }
         all
     })
+}
+
+/// Chunks of a pipe as they come, so stderr can be shown while the child
+/// runs and is never left to fill its pipe.
+async fn forward_chunks<R: AsyncRead + Unpin>(mut pipe: R, send: UnboundedSender<Vec<u8>>) {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if send.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn write_stdin(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
@@ -101,8 +139,9 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
     if let (Some(bytes), Some(pipe)) = (cmd.stdin(), child.stdin.take()) {
         tokio::spawn(write_stdin(pipe, bytes.to_vec()));
     }
-    let out = child.stdout.take().map(spawn_reader);
-    let err = child.stderr.take().map(spawn_reader);
+    let over = Arc::new(Over::default());
+    let out = child.stdout.take().map(|s| spawn_reader(s, over.clone()));
+    let err = child.stderr.take().map(|s| spawn_reader(s, over.clone()));
 
     let deadline = async {
         match cmd.deadline_limit() {
@@ -114,6 +153,7 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
     let status = tokio::select! {
         waited = child.wait() => Some(waited.map_err(|source| Error::Child { what: "wait for the command", source })?),
         () = deadline => { timed_out = true; None }
+        () = over.notice.notified() => None,
     };
     let code = match status {
         Some(s) => s.code(),
@@ -122,8 +162,15 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
             None
         }
     };
-    let stdout = collect(out, !timed_out).await;
-    let stderr = collect(err, !timed_out).await;
+    let stdout = collect(out, status.is_some()).await;
+    let stderr = collect(err, status.is_some()).await;
+    if over.hit.load(Ordering::SeqCst) {
+        return Err(Error::Tool {
+            what: cmd.program().to_string_lossy().into_owned(),
+            status: None,
+            stderr: format!("It wrote more than {} MiB, and was stopped: run a command that writes less, or stream it.", MAX_OUTPUT / (1024 * 1024)),
+        });
+    }
     Ok(Output { status: code, stdout, stderr, timed_out })
 }
 
@@ -149,8 +196,9 @@ impl Runner for SystemRunner {
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(Error::Child { what: "open the command's pipes", source: std::io::Error::other("the pipes were not created") });
         };
-        let stderr = child.stderr.take().map(spawn_reader);
-        let control = SystemControl { child, pgid, stderr, deadline: cmd.deadline_limit(), grace: self.grace };
+        let (send, stderr) = tokio::sync::mpsc::unbounded_channel();
+        let reader = child.stderr.take().map(|pipe| tokio::spawn(forward_chunks(pipe, send)));
+        let control = SystemControl { child, pgid, stderr: Some(stderr), reader, deadline: cmd.deadline_limit(), grace: self.grace };
         Ok(Duplex::from_parts(Box::new(stdout), Box::new(stdin), Box::new(control)))
     }
 }
@@ -158,7 +206,8 @@ impl Runner for SystemRunner {
 struct SystemControl {
     child: Child,
     pgid: Option<u32>,
-    stderr: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<UnboundedReceiver<Vec<u8>>>,
+    reader: Option<JoinHandle<()>>,
     deadline: Option<Duration>,
     grace: Duration,
 }
@@ -178,8 +227,24 @@ impl DuplexControl for SystemControl {
             },
             None => self.child.wait().await.map_err(|source| Error::Child { what: "wait for the command", source })?.code(),
         };
-        let stderr = collect(self.stderr.take(), !timed_out).await;
+        if let Some(reader) = self.reader.take() {
+            if timed_out {
+                let _ = tokio::time::timeout(Duration::from_secs(1), reader).await;
+            } else {
+                let _ = reader.await;
+            }
+        }
+        let mut stderr = Vec::new();
+        if let Some(chunks) = self.stderr.as_mut() {
+            while let Ok(chunk) = chunks.try_recv() {
+                stderr.extend_from_slice(&chunk);
+            }
+        }
         Ok(Output { status: code, stdout: Vec::new(), stderr, timed_out })
+    }
+
+    fn take_stderr(&mut self) -> Option<UnboundedReceiver<Vec<u8>>> {
+        self.stderr.take()
     }
 
     fn kill(&mut self) {

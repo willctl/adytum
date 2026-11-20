@@ -10,10 +10,12 @@
 //! folder at the end, also when a step fails.
 //!
 //! Three scenarios: a sealed cell from create to rm, a cell with a published
-//! port, and a clone (with the eidolon-hold guard) and a kill test (`adytum
+//! port, a clone, and a kill test (`adytum
 //! create` killed with `kill -9` while Lima is making the instance, then the
 //! next command reconciles it away).
 
+// It checks Unix file modes, so it builds only on Unix hosts.
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,6 +31,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const ID: adytum::CellId = adytum::CellId::from_bytes([7; 16]);
 
 const BIN: &str = env!("CARGO_BIN_EXE_adytum");
 
@@ -106,6 +110,57 @@ impl Drop for Env {
         }
         let _ = std::fs::remove_dir_all(&self.home);
     }
+}
+
+/// `adytum` with `input` on its stdin: the exit code, stdout and stderr.
+fn piped(home: &std::path::Path, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+    use std::io::Write as _;
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env_clear()
+        .env("ADYTUM_HOME", home)
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary starts");
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    feeder.join().unwrap();
+    (out.status.code().unwrap_or(-1), out.stdout, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A tar of one file, `<dir>/inner/hello.txt`, made on this machine.
+fn small_tar(dir: &std::path::Path) -> Vec<u8> {
+    std::fs::create_dir_all(dir.join("inner")).unwrap();
+    std::fs::write(dir.join("inner/hello.txt"), "through stdin\n").unwrap();
+    let out = Command::new("tar").args(["-c", "-f", "-", "-C"]).arg(dir).arg("inner").env("COPYFILE_DISABLE", "1").output().unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+/// `adytum exec` forwards its stdin and passes the exit code through.
+fn exec_forwards_stdin(home: &std::path::Path, name: &str, folder: &str) {
+    let tar = small_tar(&home.join("stdin-src"));
+    let (code, _, err) = piped(home, &["exec", name, "--", "mkdir", "-p", folder], b"");
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = piped(home, &["exec", name, "--", "tar", "-x", "-f", "-", "-C", folder], &tar);
+    assert_eq!(code, 0, "tar in the cell: {err}");
+    let (code, out, err) = piped(home, &["exec", name, "--", "cat", &format!("{folder}/inner/hello.txt")], b"");
+    assert_eq!((code, String::from_utf8_lossy(&out).into_owned()), (0, "through stdin\n".to_owned()), "{err}");
+    let big: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+    let (code, out, _) = piped(home, &["exec", name, "--", "cat"], &big);
+    assert_eq!((code, out.len()), (0, big.len()));
+    assert!(out == big, "the bytes changed on the way through the stream");
+    let (code, _, err) = piped(home, &["exec", name, "--", "sh", "-c", "cat >/dev/null; echo said >&2; exit 7"], b"ignored");
+    assert_eq!(code, 7, "the command's exit code passes through: {err}");
+    assert!(err.starts_with("said\n"), "{err}");
 }
 
 fn step<T>(label: &str, f: impl FnOnce() -> T) -> T {
@@ -241,6 +296,8 @@ fn sealed_cell(before: &[String]) {
     );
     assert!(!listener_reachable(18111), "reachable after the log check");
 
+    step("exec forwards stdin", || exec_forwards_stdin(&env.home, &name, "/home/cell/t"));
+
     // A stream carries bytes both ways.
     step("stream cat", || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -248,7 +305,7 @@ fn sealed_cell(before: &[String]) {
             use adytum::Driver;
             let lima = adytum::lima::Lima::system(adytum::lima::lima_home_in(&env.home)).unwrap();
             let cell: adytum::CellName = name.parse().unwrap();
-            let mut duplex = lima.stream(&cell, &["cat".to_owned()]).await.unwrap();
+            let mut duplex = lima.stream(&cell, &["cat".to_owned()], adytum::ExecOpts::default()).await.unwrap();
             duplex.write_all(b"through the stream\n").await.unwrap();
             duplex.shutdown().await.unwrap();
             let mut got = String::new();
@@ -297,8 +354,8 @@ fn listed_names(env: &Env) -> Vec<String> {
     listed["cells"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_owned()).collect()
 }
 
-/// create, stop, clone into a second cell, start and use the clone; a held
-/// source refuses the next clone; release; remove both.
+/// create, stop, clone into a second cell, start and use the clone; a clone
+/// across walls is refused; remove both.
 fn clone_cells() {
     let env = new_env();
     let (src, copy, third) = (format!("adytum-test-live-{}", random_tag()), format!("adytum-test-live-{}", random_tag()), format!("adytum-test-live-{}", random_tag()));
@@ -324,15 +381,6 @@ fn clone_cells() {
     // A clone is its own cell: a change in it does not reach the source.
     assert_eq!(env.exec(&copy, &["rm", "/var/tmp/marker"])["status"], 0);
     assert_eq!(env.json(&["stop", &copy]).0, 0);
-
-    // A held source is not cloned, however many times it is asked.
-    assert_eq!(env.json(&["hold", &src, "eid_live"]).0, 0);
-    let (code, v) = step("clone while held", || env.json(&["clone", &src, &third]));
-    assert_eq!((code, v["error"]["code"].as_str()), (1, Some("clone_open_eidolon")), "{v}");
-    assert_eq!(listed_names(&env).len(), 2, "a refused clone left a cell");
-    assert!(!env.home.join("lima").join(&third).exists());
-    let (code, v) = env.json(&["release", &src, "eid_live"]);
-    assert_eq!((code, v["held"].as_bool()), (0, Some(false)), "{v}");
 
     // A clone across walls is refused as well.
     let (code, v) = env.json(&["clone", &src, &third, "--wall", "wall_other"]);
@@ -517,12 +565,11 @@ impl Drop for NetGuard {
 fn net_spec(name: &str, wall: &str, network: &str) -> adytum::CellSpec {
     adytum::CellSpec {
         name: name.parse().unwrap(),
-        driver: adytum::DriverKind::Lima,
-        image: adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap(),
+        kind: adytum::Kind::Lima(adytum::LimaOptions::new(adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap())),
+        parent: None,
         wall: wall.parse().unwrap(),
         resources: adytum::Resources { cpus: 1, memory_mib: 1024, ..adytum::Resources::default() },
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: Some(network.parse().unwrap()),
@@ -552,7 +599,7 @@ async fn networks_scenario(env_home: &std::path::Path) {
     let specs = [net_spec(&a1, "wall_a", "lan"), net_spec(&a2, "wall_a", "lan"), net_spec(&b1, "wall_b", "lan")];
     let t = Instant::now();
     for s in &specs {
-        lima.create(s).await.unwrap();
+        lima.create(s, &ID).await.unwrap();
     }
     println!("  create 3 cells: {:.2}s", t.elapsed().as_secs_f64());
     let t = Instant::now();
@@ -606,12 +653,12 @@ async fn networks_scenario(env_home: &std::path::Path) {
 
     // Removing the cells removes the networks, the last one with the last cell.
     let t = Instant::now();
-    lima.remove(&specs[0].name).await.unwrap();
+    lima.remove(&specs[0].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[1]).await.unwrap().is_some(), "wall_a's network went while a cell still used it");
-    lima.remove(&specs[1].name).await.unwrap();
+    lima.remove(&specs[1].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[1]).await.unwrap().is_none(), "wall_a's network outlived its cells");
     assert!(lima.network_gateway(&specs[2]).await.unwrap().is_some());
-    lima.remove(&specs[2].name).await.unwrap();
+    lima.remove(&specs[2].name, &ID).await.unwrap();
     assert!(lima.network_gateway(&specs[2]).await.unwrap().is_none());
     println!("  remove 3 cells and their networks: {:.2}s", t.elapsed().as_secs_f64());
 }

@@ -5,5 +5,12 @@
       "digest": "sha256:6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec",
       "arch": "aarch64"
     }
+  },
+  "gvisor": {
+    "version": "20261116.0",
+    "aarch64": {
+      "location": "https://storage.googleapis.com/gvisor/releases/release/20261116.0/aarch64/gvisor.tar.zstd",
+      "digest": "sha256:399835d261b2b08fa82fef9c907f44e9563a5bfec8a692a1704085b041bdc06d"
+    }
   }
 }

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::exec::{tail, Command, Duplex, Output, Runner, SystemRunner};
-use crate::{CellName, CellSpec, CellState};
+use crate::{CellId, CellName, CellSpec, CellState};
 use crate::{Driver, Error, ExecOpts, GuestUser, Listed};
 use async_trait::async_trait;
 
@@ -83,6 +83,25 @@ impl OpenShell {
         }
     }
 
+    /// `host` as OpenShell sees it: the same path natively, and the WSL
+    /// distribution's own path for it (from `wslpath`) under WSL.
+    async fn local_path(&self, host: &Path) -> Result<String, Error> {
+        let file = host.to_string_lossy();
+        let bad = || Error::BadPath { path: file.to_string(), rule: "a host path must be absolute" };
+        let Some(inv) = self.profile.path_translation(&self.host, &file)? else {
+            return if file.starts_with('/') { Ok(file.to_string()) } else { Err(bad()) };
+        };
+        if !windows_absolute(&file) {
+            return Err(bad());
+        }
+        let cmd = Command::new(inv.file).args(inv.args).pass_env(&["SystemRoot"]).deadline(QUICK_DEADLINE);
+        let out = self.run(cmd, "wslpath").await?;
+        if !out.success() {
+            return Err(Error::Tool { what: "wslpath".to_owned(), status: out.status, stderr: tail(&out.stderr_lossy()) });
+        }
+        parse_wslpath(&out.stdout_lossy())
+    }
+
     async fn require(&self, name: &CellName) -> Result<(), Error> {
         let sandbox = sandbox_name(name)?;
         let out = self.run(self.command(&get(&sandbox))?.deadline(QUICK_DEADLINE), "openshell sandbox get").await?;
@@ -94,6 +113,14 @@ impl OpenShell {
         }
         Err(Error::Tool { what: "openshell sandbox get".to_owned(), status: out.status, stderr: tail(&out.stderr_lossy()) })
     }
+}
+
+/// A drive path such as `C:\work` or a share such as `\\server\work`, read
+/// as text so the rule is the same on whatever machine checks it.
+fn windows_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    drive || path.starts_with("\\\\")
 }
 
 fn sandbox_name(name: &CellName) -> Result<SandboxName, Error> {
@@ -121,7 +148,7 @@ fn refuse(what: &str) -> Error {
 
 #[async_trait]
 impl Driver for OpenShell {
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error> {
+    async fn create(&self, spec: &CellSpec, _id: &CellId) -> Result<(), Error> {
         if !spec.ports.is_empty() {
             return Err(refuse("publishing ports from an OpenShell sandbox"));
         }
@@ -133,9 +160,6 @@ impl Driver for OpenShell {
         }
         if spec.clone_from.is_some() {
             return Err(refuse("cloning an OpenShell sandbox"));
-        }
-        if spec.automation_port.is_some() {
-            return Err(refuse("an automation port in an OpenShell sandbox"));
         }
         let Some(extras) = &self.extras else {
             return Err(refuse("a sandbox without a container image (call with_extras first)"));
@@ -176,12 +200,19 @@ impl Driver for OpenShell {
         Ok(out)
     }
 
-    async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, Error> {
+    async fn stream(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Duplex, Error> {
         let sandbox = sandbox_name(name)?;
         if argv.is_empty() {
             return Err(refuse("an empty command"));
         }
-        let cmd = self.command(&exec(&sandbox, None, argv))?;
+        if opts.root || opts.stdin.is_some() {
+            return Err(refuse("a stream as root or with stdin bytes (OpenShell runs a sandbox's commands as its own user; write to the stream)"));
+        }
+        let full = crate::command_line(argv, &opts.env)?;
+        let mut cmd = self.command(&exec(&sandbox, None, &full))?;
+        if let Some(d) = opts.deadline {
+            cmd = cmd.deadline(d);
+        }
         Ok(self.runner.duplex(&cmd).await?)
     }
 
@@ -190,10 +221,8 @@ impl Driver for OpenShell {
         if owner.is_some() {
             return Err(refuse("a copy owned by another user (OpenShell writes a sandbox's files as the sandbox's own user)"));
         }
-        if !host.is_absolute() {
-            return Err(Error::BadPath { path: host.display().to_string(), rule: "a host path must be absolute" });
-        }
-        let args = upload(&sandbox, &host.to_string_lossy(), guest, false)?;
+        let local = self.local_path(host).await?;
+        let args = upload(&sandbox, &local, guest, false)?;
         self.run_ok(&args, "openshell sandbox upload", COPY_DEADLINE).await.map(|_| ())
     }
 
@@ -205,7 +234,7 @@ impl Driver for OpenShell {
         Err(refuse("stopping an OpenShell sandbox (remove it instead)"))
     }
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error> {
+    async fn remove(&self, name: &CellName, _id: &CellId) -> Result<(), Error> {
         let sandbox = sandbox_name(name)?;
         let out = self.run(self.command(&delete(&sandbox))?.deadline(CREATE_DEADLINE), "openshell sandbox delete").await?;
         if out.success() || not_found(&out.stderr_lossy()) {
@@ -224,6 +253,6 @@ impl Driver for OpenShell {
                 stderr: "There is more than one page of sandboxes. Delete old ones and list again.".to_owned(),
             });
         }
-        Ok(parsed.entries().into_iter().filter_map(|(name, phase)| Some(Listed { name: name?.parse::<CellName>().ok()?, state: state_of(phase.as_ref()) })).collect())
+        Ok(parsed.entries().into_iter().filter_map(|(name, phase)| Some(Listed { name: name?.parse::<CellName>().ok()?, state: state_of(phase.as_ref()), id: None })).collect())
     }
 }

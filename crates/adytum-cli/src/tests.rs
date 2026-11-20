@@ -18,6 +18,12 @@ impl Run {
     }
 }
 
+/// A host path as `adytum cp` hands it on: joined to the current folder,
+/// which leaves an absolute path as it is (and gives `/tmp` a drive on Windows).
+fn host(path: &str) -> String {
+    std::env::current_dir().map(|cwd| cwd.join(path).display().to_string()).unwrap_or_default()
+}
+
 struct Rig {
     driver: Arc<FakeDriver>,
     ctx: Context,
@@ -29,7 +35,7 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         let driver = Arc::new(FakeDriver::new());
         driver.on_exec(|call| if call.argv[0] == "fail" { failed(3, "bad\n") } else { ok(&call.argv.join(" ")) });
-        Rig { ctx: Context { driver: driver.clone(), home }, driver }
+        Rig { ctx: Context { drivers: driver.clone(), home, input: std::sync::Mutex::new(None) }, driver }
     }
 
     async fn go(&self, line: &str) -> Run {
@@ -111,24 +117,14 @@ async fn creating_a_name_that_exists_is_refused_by_policy() {
 #[tokio::test]
 async fn the_spec_a_create_builds_has_localhost_ports_and_no_mounts() {
     let rig = Rig::new("spec");
-    let r = rig.go("create adytum-test-p --sealed --cpus 3 --memory 3072 --port 18080:80 --automation-port 9222").await;
+    let r = rig.go("create adytum-test-p --sealed --cpus 3 --memory 3072 --port 18080:80").await;
     assert_eq!(r.code, 0, "{}", r.err);
     let spec = rig.driver.spec(&"adytum-test-p".parse().unwrap()).unwrap();
     assert_eq!((spec.resources.cpus, spec.resources.memory_mib), (3, 3072));
     assert_eq!(spec.ports.len(), 1);
     assert_eq!((spec.ports[0].host, spec.ports[0].guest, spec.ports[0].bind.to_string().as_str()), (18080, 80, "127.0.0.1"));
-    assert_eq!(spec.automation_port, Some(9222));
     assert!(spec.mounts.is_empty() && spec.sealed);
     assert_eq!(spec.wall.as_str(), "wall_default");
-}
-
-#[tokio::test]
-async fn publishing_the_automation_port_is_refused() {
-    let rig = Rig::new("auto");
-    let r = rig.go("create adytum-test-p --port 9222:9222 --automation-port 9222 --json").await;
-    assert_eq!(r.code, 1);
-    assert_eq!(r.json()["error"]["code"], "automation_port_published");
-    assert!(rig.calls().iter().all(|c| !c.starts_with("create")));
 }
 
 #[tokio::test]
@@ -160,10 +156,69 @@ async fn exec_passes_arguments_whole_and_reports_the_status() {
     assert_eq!(rig.calls().iter().filter(|c| c.starts_with("exec")).collect::<Vec<_>>(), ["exec adytum-test-a echo $(id) a b"]);
 
     let r = rig.go("exec adytum-test-a -- fail").await;
-    assert_eq!(r.code, 1);
+    assert_eq!(r.code, 3, "the command's own exit code");
     assert_eq!(r.err, "bad\nadytum: the command exited with status 3.\n");
     let r = rig.go("exec adytum-test-a --json -- fail").await;
-    assert_eq!((r.code, r.json()["status"].as_i64()), (1, Some(3)));
+    assert_eq!((r.code, r.json()["status"].as_i64()), (3, Some(3)));
+}
+
+impl Rig {
+    fn give_input(&self, bytes: &[u8]) {
+        *self.ctx.input.lock().unwrap() = Some(Box::new(std::io::Cursor::new(bytes.to_vec())));
+    }
+}
+
+/// A command at the stream's far end that reads all its input, then writes
+/// it back upper-cased and exits with `code`.
+fn shouting(driver: &FakeDriver, code: i32) {
+    driver.on_stream(move |_| {
+        let end = adytum::exec::Output { status: Some(code), stderr: b"done\n".to_vec(), ..adytum::exec::Output::default() };
+        let (ours, mut theirs) = adytum::testing::duplex_ending(end);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut got = Vec::new();
+            theirs.read_to_end(&mut got).await.unwrap();
+            theirs.write_all(&got.to_ascii_uppercase()).await.unwrap();
+        });
+        Ok(ours)
+    });
+}
+
+#[tokio::test]
+async fn input_that_is_not_a_terminal_reaches_the_command_through_a_stream() {
+    let rig = Rig::new("stdin");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    shouting(&rig.driver, 0);
+    rig.give_input(b"tar bytes\n");
+    let r = rig.go("exec adytum-test-a -- tar -x -C /home/cell/t").await;
+    assert_eq!((r.code, r.out.as_str(), r.err.as_str()), (0, "TAR BYTES\n", "done\n"));
+    assert!(rig.calls().last().is_some_and(|c| c == "stream adytum-test-a tar -x -C /home/cell/t"), "{:?}", rig.calls());
+    assert!(rig.calls().iter().all(|c| !c.starts_with("exec")), "{:?}", rig.calls());
+
+    shouting(&rig.driver, 7);
+    rig.give_input(b"x");
+    let r = rig.go("exec adytum-test-a --json -- sh -c 'exit 7'").await;
+    assert_eq!((r.code, r.json()["status"].as_i64(), r.json()["stdout"].as_str()), (7, Some(7), Some("X")));
+    // Taken once: the next command has no input to forward.
+    let r = rig.go("exec adytum-test-a -- id").await;
+    assert_eq!((r.code, r.out.as_str()), (0, "id"));
+}
+
+#[tokio::test]
+async fn input_that_never_closes_does_not_hold_a_finished_command_open() {
+    let rig = Rig::new("open-stdin");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    rig.driver.on_stream(|_| {
+        let end = adytum::exec::Output { status: Some(0), ..adytum::exec::Output::default() };
+        let (ours, theirs) = adytum::testing::duplex_ending(end);
+        // The command exits at once without reading its input.
+        drop(theirs);
+        Ok(ours)
+    });
+    let (_writer, reader) = tokio::io::duplex(64);
+    *rig.ctx.input.lock().unwrap() = Some(Box::new(reader));
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), rig.go("exec adytum-test-a -- true")).await;
+    assert_eq!(r.expect("exec waited for input that never ends").code, 0);
 }
 
 #[tokio::test]
@@ -175,9 +230,9 @@ async fn cp_works_out_which_side_is_the_cell() {
     let rel = rig.go("cp ./rel.txt adytum-test-a:/tmp/rel.txt").await;
     assert_eq!(rel.code, 0);
     let calls: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("copy_")).collect();
-    assert_eq!(calls[0], "copy_in adytum-test-a /tmp/a /home/a");
-    assert_eq!(calls[1], "copy_out adytum-test-a /home/a /tmp/b");
-    assert!(calls[2].starts_with("copy_in adytum-test-a /") && calls[2].ends_with("rel.txt /tmp/rel.txt"), "{}", calls[2]);
+    assert_eq!(calls[0], format!("copy_in adytum-test-a {} /home/a", host("/tmp/a")));
+    assert_eq!(calls[1], format!("copy_out adytum-test-a /home/a {}", host("/tmp/b")));
+    assert_eq!(calls[2], format!("copy_in adytum-test-a {} /tmp/rel.txt", host("./rel.txt")));
     assert_eq!(rig.go("cp /tmp/a /tmp/b").await.code, 2);
     assert_eq!(rig.go("cp adytum-test-a:/a adytum-test-b:/b").await.code, 2);
 }
@@ -191,7 +246,7 @@ async fn cp_gives_a_copy_into_a_cell_to_the_owner_named() {
     let bad = rig.go("cp --json --owner ../root /tmp/a adytum-test-a:/opt/a").await;
     assert_eq!((bad.code, bad.json()["error"]["code"].as_str()), (1, Some("invalid")));
     let copies: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("copy_")).collect();
-    assert_eq!(copies, ["copy_in adytum-test-a /tmp/a /opt/a (owner root)"]);
+    assert_eq!(copies, [format!("copy_in adytum-test-a {} /opt/a (owner root)", host("/tmp/a"))]);
 }
 
 #[tokio::test]
@@ -274,18 +329,9 @@ async fn a_clone_across_walls_is_refused_as_wall_clone_before_the_driver_clones(
 }
 
 #[tokio::test]
-async fn a_clone_of_a_cell_holding_an_eidolon_is_refused_until_it_is_released() {
-    let rig = Rig::new("holdclone");
+async fn a_clone_keeps_the_wall_and_publishes_nothing_of_the_source() {
+    let rig = Rig::new("clonewall");
     assert_eq!(rig.go("create adytum-test-a --wall wall_a").await.code, 0);
-    let r = rig.go("hold adytum-test-a eid_1 --json").await;
-    assert_eq!((r.code, r.json()["held"].as_bool()), (0, Some(true)), "{}", r.err);
-
-    let r = rig.go("clone adytum-test-a adytum-test-b --json").await;
-    assert_eq!(r.code, 1);
-    assert_eq!(r.json()["error"]["code"], "clone_open_eidolon");
-    assert!(rig.calls().iter().all(|c| !c.starts_with("clone")));
-
-    assert_eq!(rig.go("release adytum-test-a eid_1").await.code, 0);
     let r = rig.go("clone adytum-test-a adytum-test-b --json").await;
     assert_eq!(r.code, 0, "{}", r.out);
     assert_eq!((field(&r.json(), &["state"]).as_str(), field(&r.json(), &["wall"]).as_str()), (Some("stopped"), Some("wall_a")));
@@ -299,16 +345,6 @@ async fn a_clone_of_a_cell_holding_an_eidolon_is_refused_until_it_is_released() 
 }
 
 #[tokio::test]
-async fn hold_and_release_need_a_recorded_cell_and_a_plain_id() {
-    let rig = Rig::new("hold");
-    let r = rig.go("hold adytum-test-nope eid_1 --json").await;
-    assert_eq!(r.json()["error"]["code"], "not_recorded");
-    assert_eq!(rig.go("hold adytum-test-nope bad/id").await.code, 2);
-    let r = rig.go("hold pane eid_1 --json").await;
-    assert_eq!(r.json()["error"]["code"], "name_not_ours");
-}
-
-#[tokio::test]
 async fn start_and_stop_are_recorded_and_settled() {
     let rig = Rig::new("ops");
     assert_eq!(rig.go("create adytum-test-a").await.code, 0);
@@ -316,4 +352,114 @@ async fn start_and_stop_are_recorded_and_settled() {
     assert_eq!(rig.go("ls --json").await.json()["cells"][0]["state"], "running");
     assert_eq!(rig.go("stop adytum-test-a").await.code, 0);
     assert_eq!(rig.go("ls --json").await.json()["cells"][0]["state"], "stopped");
+}
+
+const IMAGE: &str = "docker.io/library/alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f";
+
+#[tokio::test]
+async fn a_container_in_a_cell_keeps_its_wall_and_seal_and_shows_under_it() {
+    let rig = Rig::new("nest");
+    assert_eq!(rig.go("create adytum-test-p --sealed --wall wall_x --containers").await.code, 0);
+    let r = rig.go(&format!("create adytum-test-c --kind container --parent adytum-test-p --image {IMAGE} --json")).await;
+    assert_eq!(r.code, 0, "{}", r.out);
+    let v = r.json();
+    assert_eq!((v["kind"].as_str(), v["parent"].as_str(), v["wall"].as_str(), v["sealed"].as_bool()), (Some("container"), Some("adytum-test-p"), Some("wall_x"), Some(true)));
+    assert_eq!(rig.calls(), ["create adytum-test-p", "start adytum-test-p", "create adytum-test-c"]);
+    let rows = rig.go("ls --json").await.json()["cells"].clone();
+    // In name order, each naming its parent.
+    assert_eq!((rows[0]["name"].as_str(), rows[0]["parent"].as_str(), rows[0]["kind"].as_str()), (Some("adytum-test-c"), Some("adytum-test-p"), Some("container")));
+    assert_eq!((rows[1]["name"].as_str(), &rows[1]["parent"]), (Some("adytum-test-p"), &Value::Null));
+    assert_eq!(rig.go("ls").await.out, "adytum-test-p  running  wall_x  lima\n  adytum-test-c  stopped  wall_x  container\n");
+    let r = rig.go("exec adytum-test-c --json -- id -u").await;
+    assert_eq!(r.json()["stdout"], "id -u");
+    assert!(rig.calls().last().is_some_and(|c| c == "exec adytum-test-c id -u"));
+    assert_eq!(rig.go("rm adytum-test-p --json").await.json()["removed"], true);
+    assert_eq!(rig.calls()[rig.calls().len() - 2..], ["remove adytum-test-c", "remove adytum-test-p"]);
+    assert_eq!(rig.go("ls").await.out, "no cells\n");
+}
+
+#[tokio::test]
+async fn the_nesting_rules_answer_through_the_command() {
+    let rig = Rig::new("nestrules");
+    assert_eq!(rig.go("create adytum-test-v").await.code, 0);
+    let child = format!("create adytum-test-c --kind container --image {IMAGE} --json --parent");
+    for (parent, extra, code) in [("adytum-test-v", "", "parent_cannot_host"), ("adytum-test-nope", "", "not_recorded"), ("adytum-test-v", " --wall wall_other", "parent_wall")] {
+        let r = rig.go(&format!("{child} {parent}{extra}")).await;
+        assert_eq!((r.code, r.json()["error"]["code"].as_str()), (1, Some(code)), "{parent}{extra}: {}", r.out);
+    }
+    assert_eq!(rig.go("create adytum-test-h --containers").await.code, 0);
+    let r = rig.go(&format!("{child} adytum-test-h --port 18080:80")).await;
+    assert_eq!(r.json()["error"]["code"], "nested_port");
+    let r = rig.go(&format!("{child} adytum-test-h --sealed --runtime runc")).await;
+    assert_eq!(r.json()["error"]["code"], "runc_sealed");
+    assert!(rig.calls().iter().all(|c| !c.contains("adytum-test-c")), "{:?}", rig.calls());
+    let r = rig.go(&format!("{child} adytum-test-h --runtime runc")).await;
+    assert_eq!(r.code, 0, "an open container may run under runc: {}", r.out);
+}
+
+#[tokio::test]
+async fn a_wrong_kind_or_image_is_a_usage_error_before_the_ledger_opens() {
+    let rig = Rig::new("kinds");
+    for line in [
+        "create adytum-test-c --kind container".to_owned(),
+        "create adytum-test-c --kind container --image alpine:3.22".to_owned(),
+        format!("create adytum-test-c --kind container --image {IMAGE} --containers"),
+        format!("create adytum-test-c --kind container --image {IMAGE} --nested-virtualization"),
+        "create adytum-test-c --kind vm".to_owned(),
+        format!("create adytum-test-c --kind container --image {IMAGE} --runtime kata"),
+        "create adytum-test-c --runtime runc".to_owned(),
+        "create adytum-test-c --image nonesuch".to_owned(),
+    ] {
+        let r = rig.go(&format!("{line} --json")).await;
+        assert_eq!((r.code, r.json()["error"]["code"].as_str()), (2, Some("usage")), "{line}: {}", r.out);
+    }
+    assert!(!rig.ctx.home.exists(), "a refused line made Adytum's folder");
+}
+
+#[tokio::test]
+async fn a_lima_cell_can_ask_for_containers_and_nested_virtualization() {
+    let rig = Rig::new("limaopts");
+    assert_eq!(rig.go("create adytum-test-v --containers --nested-virtualization").await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-v".parse().unwrap()).unwrap();
+    let adytum::Kind::Lima(options) = spec.kind else { panic!("{spec:?}") };
+    assert!(options.containers && options.nested_virtualization);
+}
+
+#[tokio::test]
+async fn a_child_gets_its_parents_resources_unless_told_less_and_more_is_refused() {
+    let rig = Rig::new("sizes");
+    assert_eq!(rig.go("create adytum-test-p --containers --cpus 1 --memory 1024").await.code, 0);
+    assert_eq!(rig.go(&format!("create adytum-test-c --kind container --parent adytum-test-p --image {IMAGE}")).await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-c".parse().unwrap()).unwrap();
+    assert_eq!((spec.resources.cpus, spec.resources.memory_mib), (1, 1024));
+    let r = rig.go(&format!("create adytum-test-d --kind container --parent adytum-test-p --image {IMAGE} --cpus 2 --json")).await;
+    assert_eq!(r.json()["error"]["code"], "child_too_big");
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_list_is_said_and_the_command_still_runs() {
+    let rig = Rig::new("unlisted");
+    assert_eq!(rig.go("create adytum-test-a").await.code, 0);
+    rig.driver.fail_next_list(None);
+    let r = rig.go("ls --json").await;
+    assert_eq!(r.code, 0, "{}", r.out);
+    assert_eq!(r.json()["reconciled"]["unlisted"][0]["kind"], "lima");
+    assert!(r.json()["reconciled"]["unlisted"][0]["host"].is_null());
+    assert!(r.err.contains("could not list the Lima cells on this machine"), "{}", r.err);
+    assert_eq!(r.json()["cells"][0]["name"], "adytum-test-a", "left as recorded");
+}
+
+#[tokio::test]
+async fn exec_runs_as_root_only_when_asked_and_desktop_is_for_lima() {
+    let rig = Rig::new("root");
+    assert_eq!(rig.go("create adytum-test-a --desktop").await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-a".parse().unwrap()).unwrap();
+    assert!(matches!(spec.kind, adytum::Kind::Lima(ref o) if o.desktop));
+    assert_eq!(rig.go("exec --root adytum-test-a -- id").await.code, 0);
+    assert_eq!(rig.go("exec adytum-test-a -- id").await.code, 0);
+    let execs: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("exec")).collect();
+    assert_eq!(execs, ["exec adytum-test-a (root) id", "exec adytum-test-a id"]);
+    let r = rig.go(&format!("create adytum-test-c --kind container --image {IMAGE} --desktop --json")).await;
+    assert_eq!(r.code, 2);
+    assert_eq!(rig.go("exec --sealed adytum-test-a -- id").await.code, 2);
 }

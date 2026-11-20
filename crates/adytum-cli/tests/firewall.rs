@@ -29,6 +29,8 @@ use adytum::{CellName, CellSpec, Resources};
 use adytum::{Driver, ExecOpts};
 
 /// Guest side of a reachability probe: each argument is `host:port`.
+const ID: adytum::CellId = adytum::CellId::from_bytes([7; 16]);
+
 const PROBE: &str = r#"
 import socket, sys
 for target in sys.argv[1:]:
@@ -170,12 +172,11 @@ impl Drop for Home {
 fn spec(name: &str) -> CellSpec {
     CellSpec {
         name: name.parse().unwrap(),
-        driver: adytum::DriverKind::Lima,
-        image: adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap(),
+        kind: adytum::Kind::Lima(adytum::LimaOptions::new(adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap())),
+        parent: None,
         wall: "wall_fw".parse().unwrap(),
         resources: Resources { cpus: 1, memory_mib: 1024, ..Resources::default() },
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: true,
         network: None,
@@ -228,7 +229,7 @@ async fn loopback_is_blocked() {
     println!("cell {cell}, ADYTUM_HOME {}", home.path.display());
 
     let t = Instant::now();
-    lima.create(&spec(cell.as_str())).await.unwrap();
+    lima.create(&spec(cell.as_str()), &ID).await.unwrap();
     println!("  create: {:.1}s", t.elapsed().as_secs_f64());
     let t = Instant::now();
     lima.start(&cell).await.unwrap();
@@ -299,7 +300,7 @@ async fn loopback_is_blocked() {
     assert_ne!(su.status, Some(0), "the exec user became the admin user");
 
     lima.stop(&cell).await.unwrap();
-    lima.remove(&cell).await.unwrap();
+    lima.remove(&cell, &ID).await.unwrap();
     println!("total: {:.1}s", total.elapsed().as_secs_f64());
 }
 
@@ -324,7 +325,7 @@ async fn named_network_is_walled() {
     let mut s = spec(cell.as_str());
     s.network = Some("lan".parse().unwrap());
     {
-        lima.create(&s).await.unwrap();
+        lima.create(&s, &ID).await.unwrap();
         lima.start(&cell).await.unwrap();
         let loopback = Listener::on("127.0.0.1");
         let route = run(&lima, &cell, &["ip", "-4", "route", "show", "default"]).await.out;
@@ -337,5 +338,5 @@ async fn named_network_is_walled() {
         let dns = run(&lima, &cell, &["getent", "hosts", "example.com"]).await;
         assert_eq!(dns.status, Some(0), "DNS does not resolve: {}", dns.out);
     }
-    lima.remove(&cell).await.unwrap();
+    lima.remove(&cell, &ID).await.unwrap();
 }

@@ -2,19 +2,21 @@ mod guest;
 mod network;
 mod pins;
 mod template;
+mod view;
 
-pub use pins::{image, image_names, DEFAULT_IMAGE};
+pub use guest::{DISPLAY, VNC_PORT};
+pub use pins::{gvisor, image, image_names, GvisorPin, DEFAULT_IMAGE};
+pub use view::{stream_argv, View, SECRET_LEN};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
-
+use crate::copy::{self, absolute, Channel};
 use crate::exec::{tail, Command, Duplex, Output, Runner, SystemRunner};
-use crate::{check_guest_path, command_line, CellName, CellSpec, CellState, Driver, Error, ExecOpts, GuestUser, Listed};
+use crate::{check_guest_path, command_line, CellId, CellName, CellSpec, CellState, Driver, Error, ExecOpts, GuestUser, Listed};
+use async_trait::async_trait;
 
 /// A unix socket path on macOS holds 104 bytes, its closing NUL included.
 pub(crate) const SOCKET_BUDGET: usize = 104;
@@ -139,6 +141,51 @@ impl Lima {
         Ok(self.guest_shell(name, full))
     }
 
+    /// Lima reports a start as done even when the boot script failed, so a
+    /// cell without its ready file is stopped again, with the log's end as
+    /// the reason.
+    async fn check_ready(&self, name: &CellName) -> Result<(), Error> {
+        let probe = self.shell_command(name, &["test".to_owned(), "-e".to_owned(), guest::READY.to_owned()], &[], false)?.deadline(QUICK_DEADLINE);
+        let probe = self.run(probe, "limactl shell").await?;
+        match probe.status {
+            Some(0) => Ok(()),
+            Some(1) => {
+                let log = ["tail", "-n", "20", "/var/log/cloud-init-output.log"].map(str::to_owned);
+                let log = self.run(self.shell_command(name, &log, &[], true)?.deadline(QUICK_DEADLINE), "limactl shell").await.map(|o| o.stdout_lossy()).unwrap_or_default();
+                let _ = self.run(self.limactl().args(["stop", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE), "limactl stop").await;
+                Err(Error::Tool {
+                    what: "the cell's boot script".to_owned(),
+                    status: Some(1),
+                    stderr: format!("The cell was stopped again. The end of its boot log: {}", tail(&log)),
+                })
+            }
+            _ => Err(tool_failure("limactl shell", Some(name), &probe)),
+        }
+    }
+
+    /// limactl copy follows links and reads what it is given to the end, so
+    /// a FIFO, a device or too much is refused before it starts. The cell
+    /// could change what it has between this look and the copy; the copy's
+    /// deadline still bounds it.
+    async fn check_copy_size(&self, name: &CellName, guest: &str) -> Result<(), Error> {
+        let argv = ["find", "-L", guest, "-type", "f", "-printf", "%s\\n", "-o", "-type", "d", "-o", "-printf", "special\\n", "-quit"].map(str::to_owned);
+        let out = self.run(self.shell_command(name, &argv, &[], true)?.deadline(QUICK_DEADLINE), "find in the cell").await?;
+        if !out.success() {
+            return Err(tool_failure("find in the cell", Some(name), &out));
+        }
+        let mut total: u64 = 0;
+        for line in out.stdout_lossy().lines() {
+            if line == "special" {
+                return Err(Error::Unsupported { what: "copying a FIFO, a socket or a device out of a cell".to_owned() });
+            }
+            total = total.saturating_add(line.trim().parse::<u64>().unwrap_or(0));
+            if total > copy::MAX_COPY {
+                return Err(copy::too_big());
+            }
+        }
+        Ok(())
+    }
+
     fn guest_shell(&self, name: &CellName, full: Vec<String>) -> Command {
         self.limactl().args(["shell", "--workdir=/"]).arg(name.as_str()).arg("--").args(full)
     }
@@ -146,11 +193,16 @@ impl Lima {
 
 fn tool_failure(what: &str, name: Option<&CellName>, out: &Output) -> Error {
     let stderr = out.stderr_lossy();
-    let missing = stderr.contains("does not exist") || (stderr.contains("no such file or directory") && stderr.contains("lima.yaml"));
+    let missing = name.is_some_and(|n| instance_missing(&stderr, n)) || (stderr.contains("no such file or directory") && stderr.contains("lima.yaml"));
     match name {
         Some(name) if missing => Error::NotFound { name: name.to_string() },
         _ => Error::Tool { what: what.to_owned(), status: out.status, stderr: tail(&stderr) },
     }
+}
+
+/// limactl's own words, such as ``instance `adytum-a` does not exist``.
+fn instance_missing(stderr: &str, name: &CellName) -> bool {
+    stderr.contains(&format!("instance `{name}` does not exist"))
 }
 
 fn state_of(status: &str) -> CellState {
@@ -161,33 +213,10 @@ fn state_of(status: &str) -> CellState {
     }
 }
 
-fn absolute(host: &Path) -> Result<&Path, Error> {
-    if host.is_absolute() {
-        Ok(host)
-    } else {
-        Err(Error::BadPath { path: host.display().to_string(), rule: "a host path must be absolute" })
-    }
-}
-
-/// The folder's entries, not the folder, so unpacking never changes the
-/// mode of a folder that exists. No extended attributes or AppleDouble files.
-fn host_tar(folder: &Path) -> Result<Option<Command>, Error> {
-    let entries = std::fs::read_dir(folder).map_err(|source| Error::Io { what: "read the folder to copy", source })?;
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| Error::Io { what: "read the folder to copy", source })?;
-        names.push(Path::new(".").join(entry.file_name()));
-    }
-    if names.is_empty() {
-        return Ok(None);
-    }
-    names.sort();
-    Ok(Some(Command::new("tar").args(["-c", "-f", "-", "--no-xattrs", "--no-acls", "-C"]).arg(folder).args(names).env("COPYFILE_DISABLE", "1").pass_env(&["PATH"])))
-}
-
 #[async_trait]
 impl Driver for Lima {
-    async fn create(&self, spec: &CellSpec) -> Result<(), Error> {
+    /// Lima cannot carry the id on an instance; its folder is Adytum's own.
+    async fn create(&self, spec: &CellSpec, _id: &CellId) -> Result<(), Error> {
         self.check_socket_path(&spec.name)?;
         let text = template::render(spec)?;
         let file = self.home.join("_templates").join(format!("{}.yaml", spec.name));
@@ -209,7 +238,7 @@ impl Driver for Lima {
         let start = || self.limactl().arg("start").arg("--tty=false").arg(name.as_str()).deadline(START_DEADLINE);
         let first = self.run(start(), "limactl start").await?;
         if first.success() {
-            return Ok(());
+            return self.check_ready(name).await;
         }
         // Under load Lima's host agent can miss its 5 s start-up window; the VM never came up.
         if !first.stderr_lossy().contains("did not start up in") {
@@ -218,7 +247,7 @@ impl Driver for Lima {
         let _ = self.run(self.limactl().args(["stop", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE), "limactl stop").await;
         let again = self.run(start(), "limactl start").await?;
         if again.success() {
-            return Ok(());
+            return self.check_ready(name).await;
         }
         Err(Error::Tool { what: "limactl start (tried twice: Lima's host agent did not start up)".to_owned(), status: again.status, stderr: tail(&again.stderr_lossy()) })
     }
@@ -232,73 +261,32 @@ impl Driver for Lima {
             cmd = cmd.deadline(deadline);
         }
         let out = self.runner.run(&cmd).await?;
-        if !out.success() && out.stderr_lossy().contains("level=fatal") && out.stderr_lossy().contains("does not exist") {
+        // Only limactl's own words: a command in the cell may say "does not exist" too.
+        if !out.success() && instance_missing(&out.stderr_lossy(), name) {
             return Err(Error::NotFound { name: name.to_string() });
         }
         Ok(out)
     }
 
-    async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, Error> {
-        let cmd = self.shell_command(name, argv, &[], false)?;
-        Ok(self.runner.duplex(&cmd).await?)
+    async fn stream(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Duplex, Error> {
+        if opts.stdin.is_some() {
+            return Err(Error::Unsupported { what: "stdin bytes for a stream (write them to the stream)".to_owned() });
+        }
+        let mut cmd = self.shell_command(name, argv, &opts.env, opts.root)?;
+        if let Some(deadline) = opts.deadline {
+            cmd = cmd.deadline(deadline);
+        }
+        self.runner.duplex(&cmd).await
     }
 
     async fn copy_in(&self, name: &CellName, host: &Path, guest: &str, owner: Option<&GuestUser>) -> Result<(), Error> {
         check_guest_path(guest)?;
-        let host = absolute(host)?;
-        let is_dir = std::fs::metadata(host).map_err(|source| Error::Io { what: "read what is to be copied", source })?.is_dir();
-        let tar = if is_dir { host_tar(host)? } else { None };
-        // The owner writes the copy, so it can only write where it could
-        // anyway. sudo's umask is at least 022, and tar applies it even as
-        // root, so nothing lands writable by group or others.
+        // sudo's umask is at least 022, and tar applies it even as root.
         let user = owner.map_or(guest::EXEC_USER, GuestUser::as_str);
         let as_owner = |argv: Vec<String>| self.guest_shell(name, guest::as_user(user, argv));
-        let (folder, receive) = if is_dir {
-            let tar = ["tar", "-x", "-f", "-", "--no-same-owner", "--no-same-permissions", "-C", guest];
-            (guest.to_owned(), tar.map(str::to_owned).to_vec())
-        } else {
-            let parent = Path::new(guest).parent().map_or_else(|| "/".to_owned(), |p| p.to_string_lossy().into_owned());
-            (parent, vec!["dd".to_owned(), format!("of={guest}"), "bs=1M".into(), "status=none".into()])
-        };
-        let mkdir = as_owner(["mkdir", "-p", "--", &folder].map(str::to_owned).to_vec()).deadline(QUICK_DEADLINE);
-        self.run_ok(mkdir, "mkdir in the cell", Some(name)).await?;
-        if is_dir && tar.is_none() {
-            return Ok(());
-        }
-        let mut into = self.runner.duplex(&as_owner(receive).deadline(COPY_DEADLINE)).await?;
-        let mut sender = None;
-        let pumped = tokio::time::timeout(COPY_DEADLINE, async {
-            if let Some(tar) = &tar {
-                let tar = sender.insert(self.runner.duplex(tar).await?);
-                tokio::io::copy(tar, &mut into).await.map_err(|source| Error::Io { what: "send the folder into the cell", source })?;
-            } else {
-                let mut file = tokio::fs::File::open(host).await.map_err(|source| Error::Io { what: "open the file to copy", source })?;
-                tokio::io::copy(&mut file, &mut into).await.map_err(|source| Error::Io { what: "send the file into the cell", source })?;
-            }
-            into.shutdown().await.map_err(|source| Error::Io { what: "close the copy into the cell", source })
-        })
-        .await;
-        let timed_out = pumped.is_err();
-        if timed_out {
-            into.kill();
-            if let Some(tar) = sender.as_mut() {
-                tar.kill();
-            }
-        }
-        let received = into.finish().await?;
-        if let Some(tar) = sender {
-            let sent = tar.finish().await?;
-            if !sent.success() && !timed_out {
-                return Err(Error::Tool { what: "tar on the host".to_owned(), status: sent.status, stderr: tail(&sent.stderr_lossy()) });
-            }
-        }
-        if timed_out {
-            return Err(Error::Tool { what: "the copy into the cell".to_owned(), status: None, stderr: "It did not finish before its deadline and was stopped.".to_owned() });
-        }
-        if !received.success() {
-            return Err(tool_failure("the copy into the cell", Some(name), &received));
-        }
-        pumped.unwrap_or(Ok(()))
+        let fail = |what: &str, out: &Output| tool_failure(what, Some(name), out);
+        let channel = Channel { local: &*self.runner, remote: &*self.runner, as_owner: &as_owner, fail: &fail, quick: QUICK_DEADLINE, deadline: COPY_DEADLINE };
+        copy::send(&channel, host, guest).await
     }
 
     async fn copy_out(&self, name: &CellName, guest: &str, host: &Path) -> Result<(), Error> {
@@ -315,6 +303,7 @@ impl Driver for Lima {
             Some(1) => false,
             _ => return Err(tool_failure("limactl shell", Some(name), &probe)),
         };
+        self.check_copy_size(name, guest).await?;
         let mut cmd = self.limactl().arg("copy").arg("--tty=false");
         if is_dir {
             cmd = cmd.arg("-r");
@@ -329,7 +318,7 @@ impl Driver for Lima {
         self.run_ok(cmd, "limactl stop", Some(name)).await.map(drop)
     }
 
-    async fn remove(&self, name: &CellName) -> Result<(), Error> {
+    async fn remove(&self, name: &CellName, _id: &CellId) -> Result<(), Error> {
         let networks = self.networks_of(name);
         let cmd = self.limactl().args(["delete", "--force", "--tty=false"]).arg(name.as_str()).deadline(STOP_DEADLINE);
         self.run_ok(cmd, "limactl delete", Some(name)).await?;
@@ -337,7 +326,7 @@ impl Driver for Lima {
         Ok(())
     }
 
-    async fn clone_cell(&self, from: &CellName, to: &CellSpec) -> Result<(), Error> {
+    async fn clone_cell(&self, from: &CellName, to: &CellSpec, _id: &CellId) -> Result<(), Error> {
         self.check_socket_path(&to.name)?;
         let mut edits = template::clone_edits(to)?;
         if to.network.is_none() && !self.networks_of(from).is_empty() {
@@ -378,7 +367,7 @@ impl Driver for Lima {
                 serde_json::from_str(line).map_err(|e| Error::Tool { what: "limactl list".to_owned(), status: out.status, stderr: format!("its output was not JSON: {e}") })?;
             let (Some(name), Some(status)) = (value.get("name").and_then(|v| v.as_str()), value.get("status").and_then(|v| v.as_str())) else { continue };
             if let Ok(name) = name.parse::<CellName>() {
-                cells.push(Listed { name, state: state_of(status) });
+                cells.push(Listed { name, state: state_of(status), id: None });
             }
         }
         Ok(cells)

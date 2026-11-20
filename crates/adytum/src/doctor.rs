@@ -29,6 +29,10 @@ pub struct Machine {
     pub image_cached: bool,
     /// Bytes free on the disk that holds Adytum's folder.
     pub free_bytes: Option<u64>,
+    /// The chip, such as `Apple M3 Max`, and the macOS version, such as
+    /// `26.5`: what Lima's nested virtualization needs.
+    pub chip: Option<String>,
+    pub macos: Option<String>,
     pub ledger: LedgerStatus,
 }
 
@@ -113,6 +117,12 @@ pub async fn gather() -> Machine {
         }
     };
     let limactl = ask("limactl", vec!["--version".to_owned()]).await.and_then(|text| version(&text));
+    let line = |text: String| text.lines().next().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned);
+    let (chip, macos) = if cfg!(target_os = "macos") {
+        (ask("sysctl", vec!["-n".to_owned(), "machdep.cpu.brand_string".to_owned()]).await.and_then(line), ask("sw_vers", vec!["-productVersion".to_owned()]).await.and_then(line))
+    } else {
+        (None, None)
+    };
     let home = crate::home();
     let free_bytes = match &home {
         Some(home) => ask("df", vec!["-Pk".to_owned(), nearest_existing(home).to_string_lossy().into_owned()]).await.and_then(|text| parse_df(&text)),
@@ -127,7 +137,7 @@ pub async fn gather() -> Machine {
         Some(Err(Error::SetUpAgain(why))) => LedgerStatus::SetUpAgain(why),
         Some(Err(e)) => LedgerStatus::Unreadable(e.to_string()),
     };
-    Machine { limactl, lima_home_exists: home.as_deref().is_some_and(|h| lima_home_in(h).exists()), home, image_cached, free_bytes, ledger }
+    Machine { limactl, lima_home_exists: home.as_deref().is_some_and(|h| lima_home_in(h).exists()), home, image_cached, free_bytes, chip, macos, ledger }
 }
 
 pub fn checks(machine: &Machine) -> Vec<Finding> {
@@ -152,6 +162,7 @@ pub fn checks(machine: &Machine) -> Vec<Finding> {
     } else {
         Finding::ok("image-cache", format!("The pinned image {} is not in Lima's download cache yet, so the first create downloads it.", crate::lima::DEFAULT_IMAGE))
     });
+    out.push(nested_virtualization(machine.chip.as_deref(), machine.macos.as_deref()));
     out.push(disk(machine.free_bytes));
     out.extend(ledger(&machine.ledger));
     out
@@ -192,6 +203,25 @@ fn socket_path(lima: &Path) -> Finding {
     }
 }
 
+/// Lima runs a VM inside a cell with vz on an Apple M3 or later chip and
+/// macOS 15 or later. Only cells that ask for it need it, so either answer
+/// is information, not a problem.
+fn nested_virtualization(chip: Option<&str>, macos: Option<&str>) -> Finding {
+    let generation = chip.and_then(|c| c.strip_prefix("Apple M")).and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok());
+    let major = macos.and_then(|v| v.split('.').next()?.parse::<u32>().ok());
+    let id = "nested-virtualization";
+    match (chip, macos) {
+        (Some(chip), Some(macos)) if generation.is_some_and(|g| g >= 3) && major.is_some_and(|m| m >= 15) => {
+            Finding::ok(id, format!("This Mac ({chip}, macOS {macos}) can run VMs inside Lima cells made with nested virtualization on."))
+        }
+        (Some(chip), Some(macos)) => Finding::ok(
+            id,
+            format!("This Mac ({chip}, macOS {macos}) cannot run VMs inside Lima cells: that needs an Apple M3 or later chip and macOS 15 or later, so leave nested virtualization off."),
+        ),
+        _ => Finding::ok(id, "Nested virtualization needs a Mac with an Apple M3 or later chip and macOS 15 or later, and this does not look like one."),
+    }
+}
+
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -222,11 +252,7 @@ fn ledger(status: &LedgerStatus) -> Vec<Finding> {
                 "Run any adytum command to finish them.",
             ),
         ],
-        LedgerStatus::SetUpAgain(why) => vec![Finding::fail(
-            "ledger",
-            format!("The ledger cannot be used: {why}"),
-            "Set Adytum up again: move adytum.sqlite out of Adytum's folder, remove the cells it made (`limactl list`, names starting adytum-), then run any adytum command.",
-        )],
+        LedgerStatus::SetUpAgain(why) => vec![Finding::fail("ledger", format!("The ledger cannot be used: {why}"), crate::error::RESET)],
         LedgerStatus::Unreadable(why) => {
             vec![Finding::fail("ledger", format!("The ledger could not be opened: {why}"), "Check that Adytum's folder can be read and written and the disk is not full.")]
         }

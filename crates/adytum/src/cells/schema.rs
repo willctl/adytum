@@ -6,7 +6,8 @@ pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE cells (
         name TEXT PRIMARY KEY,
         id TEXT NOT NULL,
-        driver TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        parent TEXT REFERENCES cells (name) ON DELETE CASCADE,
         wall TEXT NOT NULL,
         spec_json TEXT NOT NULL,
         state TEXT NOT NULL,
@@ -22,11 +23,7 @@ pub(crate) const TABLES: &[&str] = &[
         outcome TEXT
     )",
     "CREATE INDEX ops_open ON ops (id) WHERE settled_at IS NULL",
-    "CREATE TABLE holds (
-        name TEXT NOT NULL,
-        eidolon TEXT NOT NULL,
-        PRIMARY KEY (name, eidolon)
-    ) WITHOUT ROWID",
+    "CREATE INDEX cells_parent ON cells (parent)",
 ];
 
 /// The first 31 bits of the tables' SHA-256, never 0, which is SQLite's

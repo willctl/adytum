@@ -4,15 +4,92 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::CellId;
-use crate::model::names::{CellName, NetworkName, Wall};
+use crate::model::names::{CellName, NetworkName, OciImage, Wall};
 use crate::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// What a cell is, with what that kind of cell needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DriverKind {
-    Lima,
+pub enum Kind {
+    Lima(LimaOptions),
+    Container(ContainerOptions),
+    /// The sandbox's image and policy are given to the driver.
     #[serde(rename = "openshell")]
     OpenShell,
+}
+
+/// A kind without its options: what picks a driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KindName {
+    Lima,
+    Container,
+    #[serde(rename = "openshell")]
+    OpenShell,
+}
+
+impl Kind {
+    pub fn name(&self) -> KindName {
+        match self {
+            Kind::Lima(_) => KindName::Lima,
+            Kind::Container(_) => KindName::Container,
+            Kind::OpenShell => KindName::OpenShell,
+        }
+    }
+
+    /// Whether a cell of this kind can run a cell of `child`'s kind inside it.
+    pub fn hosts(&self, child: KindName) -> bool {
+        matches!((self, child), (Kind::Lima(options), KindName::Container) if options.containers)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimaOptions {
+    pub image: ImagePin,
+    /// Runs containerd and nerdctl as root in the guest, so the cell can
+    /// hold container cells.
+    #[serde(default)]
+    pub containers: bool,
+    /// Lets the guest run VMs of its own. Lima does it with vz on an M3 or
+    /// later chip.
+    #[serde(default)]
+    pub nested_virtualization: bool,
+    /// A virtual display for the cell's user, and a screen share on the
+    /// guest's loopback that `adytum view` opens one session at a time.
+    #[serde(default)]
+    pub desktop: bool,
+}
+
+impl LimaOptions {
+    pub fn new(image: ImagePin) -> LimaOptions {
+        LimaOptions { image, containers: false, nested_virtualization: false, desktop: false }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerOptions {
+    pub image: OciImage,
+    #[serde(default)]
+    pub runtime: Runtime,
+}
+
+impl ContainerOptions {
+    pub fn new(image: OciImage) -> ContainerOptions {
+        ContainerOptions { image, runtime: Runtime::default() }
+    }
+}
+
+/// What runs a container. gVisor gives it a kernel of its own in user
+/// space, so a flaw in the parent's kernel is not one step away; runc runs
+/// it on the parent's kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Runtime {
+    #[default]
+    Gvisor,
+    Runc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,13 +174,12 @@ impl Default for Resources {
 #[serde(deny_unknown_fields)]
 pub struct CellSpec {
     pub name: CellName,
-    pub driver: DriverKind,
-    pub image: ImagePin,
+    pub kind: Kind,
+    /// The cell this one runs in; `None` is this machine.
+    pub parent: Option<CellName>,
     pub wall: Wall,
     pub resources: Resources,
     pub ports: Vec<Port>,
-    /// The guest port of the browser's automation socket; never published.
-    pub automation_port: Option<u16>,
     pub mounts: Vec<Mount>,
     /// A sealed cell has nothing from the host.
     pub sealed: bool,
@@ -127,8 +203,6 @@ pub struct Cell {
     pub id: CellId,
     pub spec: CellSpec,
     pub state: CellState,
-    /// The open eidolons recorded as held in it. A held cell is not cloned.
-    pub holds: Vec<String>,
 }
 
 #[cfg(test)]
@@ -177,9 +251,36 @@ mod tests {
     }
 
     #[test]
-    fn states_and_drivers_are_snake_case() {
+    fn a_container_spec_reads_back_what_it_wrote() {
+        let mut spec: CellSpec = serde_json::from_str(GOLDEN).unwrap();
+        spec.kind = Kind::Container(ContainerOptions::new(format!("docker.io/library/alpine:3.22@sha256:{}", "ab".repeat(32)).parse().unwrap()));
+        spec.parent = Some("adytum-host".parse().unwrap());
+        let text = serde_json::to_string(&spec).unwrap();
+        assert!(text.contains(r#""kind":{"container":{"image":"docker.io/library/alpine:3.22@sha256:abab"#) && text.contains(r#""runtime":"gvisor""#), "{text}");
+        assert_eq!(serde_json::from_str::<CellSpec>(&text).unwrap(), spec);
+        spec.kind = Kind::OpenShell;
+        assert!(serde_json::to_string(&spec).unwrap().contains(r#""kind":"openshell""#));
+    }
+
+    #[test]
+    fn only_a_lima_cell_that_runs_containers_hosts_one() {
+        let pin = ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64).unwrap();
+        let mut lima = LimaOptions::new(pin);
+        assert!(!Kind::Lima(lima.clone()).hosts(KindName::Container));
+        lima.containers = true;
+        assert!(Kind::Lima(lima.clone()).hosts(KindName::Container));
+        for kind in [KindName::Lima, KindName::OpenShell] {
+            assert!(!Kind::Lima(lima.clone()).hosts(kind), "{kind:?}");
+        }
+        let image: OciImage = format!("a@sha256:{}", "0".repeat(64)).parse().unwrap();
+        assert!(!Kind::Container(ContainerOptions::new(image)).hosts(KindName::Container));
+        assert!(!Kind::OpenShell.hosts(KindName::Container));
+    }
+
+    #[test]
+    fn states_and_kinds_are_snake_case() {
         assert_eq!(serde_json::to_string(&CellState::Removing).unwrap(), "\"removing\"");
-        assert_eq!(serde_json::to_string(&DriverKind::Lima).unwrap(), "\"lima\"");
+        assert_eq!(serde_json::to_string(&KindName::OpenShell).unwrap(), "\"openshell\"");
         assert_eq!(serde_json::to_string(&Arch::X86_64).unwrap(), "\"x86_64\"");
     }
 }

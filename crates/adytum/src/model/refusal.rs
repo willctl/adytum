@@ -6,32 +6,53 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RefusalCode {
     PortNotLocalhost,
-    /// The automation port is published.
-    AutomationPortPublished,
     SealedCellMount,
     NameNotOurs,
     NameTaken,
     WallNetwork,
     WallMount,
     WallClone,
-    CloneOpenEidolon,
     /// An OpenShell policy file changed after it was previewed.
     PolicyChanged,
+    ParentMissing,
+    ParentWall,
+    ParentCannotHost,
+    ParentSealed,
+    NestedPort,
+    NestedMount,
+    TooDeep,
+    CloneHost,
+    ChildTooBig,
+    RuncSealed,
+    OpenContainerHere,
+    CloneSourceMissing,
+    CloneHasCells,
 }
 
 impl RefusalCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PortNotLocalhost => "port_not_localhost",
-            Self::AutomationPortPublished => "automation_port_published",
             Self::SealedCellMount => "sealed_cell_mount",
             Self::NameNotOurs => "name_not_ours",
             Self::NameTaken => "name_taken",
             Self::WallNetwork => "wall_network",
             Self::WallMount => "wall_mount",
             Self::WallClone => "wall_clone",
-            Self::CloneOpenEidolon => "clone_open_eidolon",
             Self::PolicyChanged => "policy_changed",
+            Self::ParentMissing => "parent_missing",
+            Self::ParentWall => "parent_wall",
+            Self::ParentCannotHost => "parent_cannot_host",
+            Self::ParentSealed => "parent_sealed",
+            Self::NestedPort => "nested_port",
+            Self::NestedMount => "nested_mount",
+            Self::TooDeep => "too_deep",
+            Self::CloneHost => "clone_host",
+            Self::ChildTooBig => "child_too_big",
+            Self::RuncSealed => "runc_sealed",
+            Self::OpenContainerHere => "open_container_here",
+            Self::CloneSourceMissing => "clone_source_missing",
+            Self::CloneHasCells => "clone_has_cells",
         }
     }
 }
@@ -67,15 +88,26 @@ mod tests {
     fn codes_travel_as_their_stable_names() {
         let pairs = [
             (RefusalCode::PortNotLocalhost, "port_not_localhost"),
-            (RefusalCode::AutomationPortPublished, "automation_port_published"),
             (RefusalCode::SealedCellMount, "sealed_cell_mount"),
             (RefusalCode::NameNotOurs, "name_not_ours"),
             (RefusalCode::NameTaken, "name_taken"),
             (RefusalCode::WallNetwork, "wall_network"),
             (RefusalCode::WallMount, "wall_mount"),
             (RefusalCode::WallClone, "wall_clone"),
-            (RefusalCode::CloneOpenEidolon, "clone_open_eidolon"),
             (RefusalCode::PolicyChanged, "policy_changed"),
+            (RefusalCode::ParentMissing, "parent_missing"),
+            (RefusalCode::ParentWall, "parent_wall"),
+            (RefusalCode::ParentCannotHost, "parent_cannot_host"),
+            (RefusalCode::ParentSealed, "parent_sealed"),
+            (RefusalCode::NestedPort, "nested_port"),
+            (RefusalCode::NestedMount, "nested_mount"),
+            (RefusalCode::TooDeep, "too_deep"),
+            (RefusalCode::CloneHost, "clone_host"),
+            (RefusalCode::ChildTooBig, "child_too_big"),
+            (RefusalCode::RuncSealed, "runc_sealed"),
+            (RefusalCode::OpenContainerHere, "open_container_here"),
+            (RefusalCode::CloneSourceMissing, "clone_source_missing"),
+            (RefusalCode::CloneHasCells, "clone_has_cells"),
         ];
         for (code, text) in pairs {
             assert_eq!(code.as_str(), text);

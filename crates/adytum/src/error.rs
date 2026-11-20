@@ -5,6 +5,9 @@ use crate::{CellName, Refusal};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// How to start over with a ledger this Adytum cannot read.
+pub(crate) const RESET: &str = "To start over, delete the cells it recorded with `LIMA_HOME=<Adytum's folder>/lima limactl delete --force <name>` for each adytum-* name `limactl list` shows there, move adytum.sqlite out of Adytum's folder, and run any adytum command: it makes a new ledger.";
+
 /// Why Adytum did not do what it was asked. [`Error::code`] is stable for
 /// scripts; the message and [`Error::fix`] are sentences for a person.
 #[derive(Debug)]
@@ -80,7 +83,7 @@ impl Error {
             Self::Spawn { .. } => "Check that it is executable.",
             Self::Child { .. } | Self::Ledger(_) => "Check the disk and the folder's permissions, then try again.",
             Self::Io { .. } => "Check that the path exists and can be read and written.",
-            Self::SetUpAgain(_) | Self::Corrupt(_) => "Move adytum.sqlite out of Adytum's folder, remove the cells it made with `limactl delete`, and run the command again.",
+            Self::SetUpAgain(_) | Self::Corrupt(_) => RESET,
         }
     }
 }

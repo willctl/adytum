@@ -10,13 +10,13 @@ mod system;
 pub use command::Command;
 pub use duplex::{Duplex, DuplexControl};
 pub use spawned::{Exit, Spawned, StderrTail};
-pub use system::SystemRunner;
+pub use system::{SystemRunner, MAX_OUTPUT};
 
 use async_trait::async_trait;
 
 use crate::Error;
 
-#[cfg(any(feature = "lima", feature = "openshell"))]
+#[cfg(any(feature = "lima", feature = "openshell", feature = "container"))]
 pub(crate) fn tail(text: &str) -> String {
     const KEPT: usize = 2000;
     let text = text.trim();

@@ -1,5 +1,6 @@
 //! A file with another schema hash in `user_version` is refused and left
-//! alone; nothing is migrated.
+//! alone; nothing is migrated. A cell's row names the cell it runs in, and
+//! goes when that row goes.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -93,11 +94,20 @@ fn is_empty(c: &Connection) -> Result<bool, Error> {
 }
 
 fn other_version(file: &Path, v: i32) -> Error {
-    Error::SetUpAgain(format!(
-        "{} was made by another Adytum (version {v}, this one's is {}): it is left as it is; set Adytum up again on this machine.",
-        file.display(),
-        schema::version()
-    ))
+    Error::SetUpAgain(format!("{} was made by another Adytum (version {v}, this one's is {}), and is left as it is.", file.display(), schema::version()))
+}
+
+fn read_cells(conn: &Connection) -> Result<Vec<Cell>, Error> {
+    let mut stmt = conn.prepare("SELECT id, spec_json, state FROM cells ORDER BY name")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, spec_json, state) = row?;
+        let id = id.parse::<CellId>().map_err(|e| Error::Corrupt(e.to_string()))?;
+        let spec = serde_json::from_str::<CellSpec>(&spec_json).map_err(|e| Error::Corrupt(e.to_string()))?;
+        out.push(Cell { id, spec, state: enum_parse(&state)? });
+    }
+    Ok(out)
 }
 
 impl Ledger {
@@ -133,7 +143,7 @@ impl Ledger {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if version_of(&tx)? == 0 {
             if !is_empty(&tx)? {
-                return Err(Error::SetUpAgain("the file holds a database that is not Adytum's ledger: it is left as it is; set Adytum up again on this machine.".to_owned()));
+                return Err(Error::SetUpAgain("The file holds a database that is not Adytum's ledger, and is left as it is.".to_owned()));
             }
             for t in schema::TABLES {
                 tx.execute_batch(t)?;
@@ -158,25 +168,33 @@ impl Ledger {
         Ok(out)
     }
 
-    pub(crate) fn intend_create(&self, spec: &CellSpec) -> Result<OpId, Error> {
+    /// Every rule runs again here, inside the write, so a cell that changed
+    /// since the caller looked cannot be adopted: `parent`, when given, is
+    /// the id the caller checked the parent by.
+    pub(crate) fn intend_create(&self, spec: &CellSpec, parent: Option<CellId>) -> Result<(OpId, CellId), Error> {
         let id = CellId::new_random()?;
         let spec_json = serde_json::to_string(spec).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let driver = enum_text(&spec.driver)?;
+        let kind = enum_text(&spec.kind.name())?;
         let state = enum_text(&CellState::Creating)?;
         let at = now();
         self.write(|tx| {
-            let taken: Option<i64> = tx.query_row("SELECT 1 FROM cells WHERE name = ?1", [spec.name.as_str()], |r| r.get(0)).optional()?;
-            if taken.is_some() {
-                return Err(
-                    Refusal::new(RefusalCode::NameTaken, format!("The ledger already has a cell named {}.", spec.name), "Pick another name or remove that cell first.").into()
-                );
+            let cells = read_cells(tx)?;
+            crate::policy::check_create(spec, &cells)?;
+            let now_parent = spec.parent.as_ref().and_then(|p| cells.iter().find(|c| &c.spec.name == p)).map(|c| c.id);
+            if now_parent != parent {
+                return Err(Refusal::new(
+                    RefusalCode::ParentMissing,
+                    format!("The cell {} was to run in was removed or made again while it started.", spec.name),
+                    "Check the parent with `adytum ls`, and create the cell again.",
+                )
+                .into());
             }
             tx.execute(
-                "INSERT INTO cells (name, id, driver, wall, spec_json, state, created_at, settled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-                params![spec.name.as_str(), id.to_string(), driver, spec.wall.as_str(), spec_json, state, at],
+                "INSERT INTO cells (name, id, kind, parent, wall, spec_json, state, created_at, settled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![spec.name.as_str(), id.to_string(), kind, spec.parent.as_ref().map(CellName::as_str), spec.wall.as_str(), spec_json, state, at],
             )?;
             tx.execute("INSERT INTO ops (name, kind, started_at) VALUES (?1, 'create', ?2)", params![spec.name.as_str(), at])?;
-            Ok(OpId(tx.last_insert_rowid()))
+            Ok((OpId(tx.last_insert_rowid()), id))
         })
     }
 
@@ -219,7 +237,6 @@ impl Ledger {
                 Ok(())
             };
             let delete = || -> Result<(), Error> {
-                tx.execute("DELETE FROM holds WHERE name = ?1", [&name])?;
                 tx.execute("DELETE FROM cells WHERE name = ?1", [&name])?;
                 Ok(())
             };
@@ -243,44 +260,13 @@ impl Ledger {
 
     pub(crate) fn forget(&self, name: &CellName) -> Result<(), Error> {
         self.write(|tx| {
-            tx.execute("DELETE FROM holds WHERE name = ?1", [name.as_str()])?;
             tx.execute("DELETE FROM cells WHERE name = ?1", [name.as_str()])?;
             Ok(())
         })
     }
 
     pub(crate) fn cells(&self) -> Result<Vec<Cell>, Error> {
-        let guard = self.lock();
-        let mut holds = guard.prepare("SELECT eidolon FROM holds WHERE name = ?1 ORDER BY eidolon")?;
-        let mut stmt = guard.prepare("SELECT name, id, spec_json, state FROM cells ORDER BY name")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (name, id, spec_json, state) = row?;
-            let id = id.parse::<CellId>().map_err(|e| Error::Corrupt(e.to_string()))?;
-            let spec = serde_json::from_str::<CellSpec>(&spec_json).map_err(|e| Error::Corrupt(e.to_string()))?;
-            let held = holds.query_map([&name], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
-            out.push(Cell { id, spec, state: enum_parse(&state)?, holds: held });
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn hold(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.write(|tx| {
-            let known: Option<i64> = tx.query_row("SELECT 1 FROM cells WHERE name = ?1", [name.as_str()], |r| r.get(0)).optional()?;
-            if known.is_none() {
-                return Err(Error::NotRecorded(name.clone()));
-            }
-            tx.execute("INSERT OR IGNORE INTO holds (name, eidolon) VALUES (?1, ?2)", params![name.as_str(), eidolon])?;
-            Ok(())
-        })
-    }
-
-    pub(crate) fn release(&self, name: &CellName, eidolon: &str) -> Result<(), Error> {
-        self.write(|tx| {
-            tx.execute("DELETE FROM holds WHERE name = ?1 AND eidolon = ?2", params![name.as_str(), eidolon])?;
-            Ok(())
-        })
+        read_cells(&self.lock())
     }
 
     pub(crate) fn open_ops(&self) -> Result<Vec<OpenOp>, Error> {

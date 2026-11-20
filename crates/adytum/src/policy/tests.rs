@@ -1,9 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-use crate::{Arch, Cell, CellId, CellName, CellSpec, CellState, DriverKind, ImagePin, Mount, NetworkName, Port, Refusal, RefusalCode, Resources};
+use crate::{Arch, Cell, CellId, CellName, CellSpec, CellState, ImagePin, Kind, LimaOptions, Mount, NetworkName, Port, Refusal, RefusalCode, Resources};
 use proptest::prelude::*;
 
+use crate::model::tree::MAX_DEPTH;
 use crate::policy::*;
 
 fn name(s: &str) -> CellName {
@@ -13,12 +14,11 @@ fn name(s: &str) -> CellName {
 fn spec(n: &str, wall: &str) -> CellSpec {
     CellSpec {
         name: name(n),
-        driver: DriverKind::Lima,
-        image: ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64).unwrap(),
+        kind: Kind::Lima(LimaOptions::new(ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64).unwrap())),
+        parent: None,
         wall: wall.parse().unwrap(),
         resources: Resources::default(),
         ports: vec![],
-        automation_port: None,
         mounts: vec![],
         sealed: false,
         network: None,
@@ -27,7 +27,7 @@ fn spec(n: &str, wall: &str) -> CellSpec {
 }
 
 fn cell(n: &str, wall: &str) -> Cell {
-    Cell { id: CellId::from_bytes([0; 16]), spec: spec(n, wall), state: CellState::Stopped, holds: vec![] }
+    Cell { id: CellId::from_bytes([0; 16]), spec: spec(n, wall), state: CellState::Stopped }
 }
 
 fn port(guest: u16, bind: IpAddr) -> Port {
@@ -57,22 +57,6 @@ fn ports_on_other_addresses_are_refused() {
 fn loopback_ports_pass() {
     let mut s = spec("adytum-a", "wall_a");
     s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into()), port(81, Ipv4Addr::new(127, 5, 5, 5).into()), port(82, Ipv6Addr::LOCALHOST.into())];
-    assert!(check_spec(&s).is_ok());
-}
-
-#[test]
-fn published_automation_port_is_refused_even_on_localhost() {
-    let mut s = spec("adytum-a", "wall_a");
-    s.automation_port = Some(9222);
-    s.ports = vec![port(9222, Ipv4Addr::LOCALHOST.into())];
-    assert_eq!(code(check_spec(&s)), RefusalCode::AutomationPortPublished);
-}
-
-#[test]
-fn automation_port_not_in_ports_passes() {
-    let mut s = spec("adytum-a", "wall_a");
-    s.automation_port = Some(9222);
-    s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into())];
     assert!(check_spec(&s).is_ok());
 }
 
@@ -189,16 +173,7 @@ fn cloning_within_a_wall_passes() {
 }
 
 #[test]
-fn cloning_a_cell_with_an_open_eidolon_is_refused() {
-    let mut s = spec("adytum-b", "wall_a");
-    s.clone_from = Some(name("adytum-a"));
-    let mut theirs = cell("adytum-a", "wall_a");
-    theirs.holds = vec!["eid_open".into()];
-    assert_eq!(code(check_create(&s, &[theirs])), RefusalCode::CloneOpenEidolon);
-}
-
-#[test]
-fn cloning_a_cell_without_one_passes() {
+fn cloning_from_the_same_wall_or_from_the_image_passes() {
     let mut s = spec("adytum-b", "wall_a");
     s.clone_from = Some(name("adytum-a"));
     assert!(check_create(&s, &[cell("adytum-a", "wall_a")]).is_ok());
@@ -216,6 +191,161 @@ fn check_create_passes_a_clean_spec_and_reports_the_first_refusal() {
     assert_eq!(code(check_create(&s, &w)), RefusalCode::PortNotLocalhost);
     s.ports.clear();
     assert_eq!(code(check_create(&s, &w)), RefusalCode::NameTaken);
+}
+
+fn host(n: &str, wall: &str) -> Cell {
+    let mut c = cell(n, wall);
+    if let Kind::Lima(options) = &mut c.spec.kind {
+        options.containers = true;
+    }
+    c
+}
+
+fn container(n: &str, wall: &str, parent: &str) -> CellSpec {
+    let image = format!("docker.io/library/alpine@sha256:{}", "0".repeat(64)).parse().unwrap();
+    CellSpec { kind: Kind::Container(crate::ContainerOptions::new(image)), parent: Some(name(parent)), ..spec(n, wall) }
+}
+
+#[test]
+fn a_cell_in_a_parent_that_can_hold_it_passes() {
+    let mut sealed_host = host("adytum-p", "wall_a");
+    sealed_host.spec.sealed = true;
+    let mut child = container("adytum-c", "wall_a", "adytum-p");
+    child.sealed = true;
+    assert!(check_create(&child, &[sealed_host]).is_ok());
+    let unsealed_child = container("adytum-c", "wall_a", "adytum-p");
+    assert!(check_create(&unsealed_child, &[host("adytum-p", "wall_a")]).is_ok());
+    let mut sealed_child = unsealed_child.clone();
+    sealed_child.sealed = true;
+    assert!(check_create(&sealed_child, &[host("adytum-p", "wall_a")]).is_ok(), "a sealed child of an open parent");
+}
+
+#[test]
+fn a_parent_that_is_not_recorded_is_refused() {
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[])), RefusalCode::ParentMissing);
+}
+
+#[test]
+fn a_child_behind_another_wall_than_its_parent_is_refused() {
+    assert_eq!(code(check_create(&container("adytum-c", "wall_b", "adytum-p"), &[host("adytum-p", "wall_a")])), RefusalCode::ParentWall);
+}
+
+#[test]
+fn a_parent_that_cannot_run_the_childs_kind_is_refused() {
+    // A Lima cell without containers, a Lima cell in a Lima cell, a container in a container.
+    let plain = cell("adytum-p", "wall_a");
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[plain])), RefusalCode::ParentCannotHost);
+    let vm_in_vm = CellSpec { parent: Some(name("adytum-p")), ..spec("adytum-c", "wall_a") };
+    assert_eq!(code(check_create(&vm_in_vm, &[host("adytum-p", "wall_a")])), RefusalCode::ParentCannotHost);
+    let inner = Cell { id: CellId::from_bytes([1; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Running };
+    let refused = check_create(&container("adytum-d", "wall_a", "adytum-c"), &[host("adytum-p", "wall_a"), inner]);
+    let r = refused.err().unwrap();
+    assert_eq!(r.code, RefusalCode::ParentCannotHost);
+    assert!(r.message.contains("container") && !r.fix.is_empty(), "{r:?}");
+}
+
+#[test]
+fn a_sealed_parent_holds_only_sealed_cells() {
+    let mut p = host("adytum-p", "wall_a");
+    p.spec.sealed = true;
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[p])), RefusalCode::ParentSealed);
+}
+
+#[test]
+fn a_nested_cell_publishes_no_port_and_mounts_nothing_even_on_loopback() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into())];
+    assert_eq!(code(check_spec(&s)), RefusalCode::NestedPort);
+    s.ports.clear();
+    s.mounts = vec![mount("/work/a")];
+    assert_eq!(code(check_spec(&s)), RefusalCode::NestedMount);
+    assert_eq!(code(check_create(&s, &[host("adytum-p", "wall_a")])), RefusalCode::NestedMount, "before the parent is even looked at");
+}
+
+#[test]
+fn a_cell_too_deep_is_refused() {
+    // Hosts that could hold anything, three deep: the fourth level is refused.
+    let mut cells = vec![host("adytum-l0", "wall_a")];
+    for i in 1..MAX_DEPTH {
+        let mut c = host(&format!("adytum-l{i}"), "wall_a");
+        c.spec.parent = Some(name(&format!("adytum-l{}", i - 1)));
+        cells.push(c);
+    }
+    let deepest = format!("adytum-l{}", MAX_DEPTH - 1);
+    assert!(check_create(&container("adytum-c", "wall_a", &deepest), &cells).is_ok());
+    let mut c = host("adytum-c", "wall_a");
+    c.spec.parent = Some(name(&deepest));
+    cells.push(c);
+    assert_eq!(code(check_create(&container("adytum-d", "wall_a", "adytum-c"), &cells)), RefusalCode::TooDeep);
+}
+
+#[test]
+fn a_child_asks_for_no_more_than_its_parent_has() {
+    let p = host("adytum-p", "wall_a");
+    let have = p.spec.resources;
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.resources = have;
+    assert!(check_create(&s, std::slice::from_ref(&p)).is_ok(), "as much as the parent is fine");
+    for want in [Resources { cpus: have.cpus + 1, ..have }, Resources { memory_mib: have.memory_mib + 1, ..have }] {
+        s.resources = want;
+        let r = check_create(&s, std::slice::from_ref(&p)).err().unwrap();
+        assert_eq!(r.code, RefusalCode::ChildTooBig);
+        assert!(r.message.contains("adytum-p") && !r.fix.is_empty(), "{r:?}");
+    }
+    // A container's disk is the parent's own; it is not compared.
+    s.resources = Resources { disk_gib: have.disk_gib * 10, ..have };
+    assert!(check_create(&s, &[p]).is_ok());
+}
+
+#[test]
+fn a_sealed_container_runs_under_gvisor_only() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.sealed = true;
+    assert!(check_spec(&s).is_ok());
+    if let Kind::Container(options) = &mut s.kind {
+        options.runtime = crate::Runtime::Runc;
+    }
+    let r = check_spec(&s).err().unwrap();
+    assert_eq!(r.code, RefusalCode::RuncSealed);
+    s.sealed = false;
+    assert!(check_create(&s, &[host("adytum-p", "wall_a")]).is_ok(), "an open container may ask for runc");
+}
+
+#[test]
+fn a_container_on_this_machine_is_sealed() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.parent = None;
+    s.sealed = false;
+    let r = check_spec(&s).err().unwrap();
+    assert_eq!(r.code, RefusalCode::OpenContainerHere);
+    assert!(r.fix.contains("sealed"), "{r:?}");
+    s.sealed = true;
+    assert!(check_spec(&s).is_ok());
+}
+
+#[test]
+fn only_a_recorded_cell_with_no_cells_inside_is_cloned() {
+    let mut s = spec("adytum-b", "wall_a");
+    s.clone_from = Some(name("adytum-unrecorded"));
+    assert_eq!(code(check_create(&s, &[])), RefusalCode::CloneSourceMissing);
+    s.clone_from = Some(name("adytum-p"));
+    let child = Cell { id: CellId::from_bytes([3; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Stopped };
+    assert_eq!(code(check_create(&s, &[host("adytum-p", "wall_a"), child])), RefusalCode::CloneHasCells);
+    assert!(check_create(&s, &[host("adytum-p", "wall_a")]).is_ok());
+}
+
+#[test]
+fn a_clone_is_made_where_its_source_runs() {
+    let source = Cell { id: CellId::from_bytes([2; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Stopped };
+    let cells = [host("adytum-p", "wall_a"), host("adytum-q", "wall_a"), source];
+    let mut copy = container("adytum-d", "wall_a", "adytum-q");
+    copy.clone_from = Some(name("adytum-c"));
+    assert_eq!(code(check_create(&copy, &cells)), RefusalCode::CloneHost);
+    copy.parent = Some(name("adytum-p"));
+    assert!(check_create(&copy, &cells).is_ok());
+    let mut from_machine = spec("adytum-e", "wall_a");
+    from_machine.clone_from = Some(name("adytum-c"));
+    assert_eq!(code(check_create(&from_machine, &cells)), RefusalCode::CloneHost);
 }
 
 proptest! {
@@ -252,7 +382,6 @@ proptest! {
         suffix in "[a-z0-9][a-z0-9-]{0,45}[a-z0-9]",
         wall in "[a-z0-9_-]{1,64}",
         ports in proptest::collection::vec((1u16..9000, any::<u8>()), 0..4),
-        automation in proptest::option::of(9000u16..9999),
         sealed in any::<bool>(),
     ) {
         let mut s = spec(&format!("adytum-{suffix}"), &format!("wall_{wall}"));
@@ -260,7 +389,6 @@ proptest! {
             .into_iter()
             .map(|(g, last)| port(g, Ipv4Addr::new(127, 0, 0, last).into()))
             .collect();
-        s.automation_port = automation;
         s.sealed = sealed;
         if !sealed {
             s.mounts = vec![mount("/work/a")];

@@ -3,9 +3,9 @@
 //! The template turns each of those off.
 
 use crate::Error;
-use crate::{Arch, CellSpec, DriverKind};
+use crate::{Arch, CellSpec, Kind, LimaOptions};
 
-use crate::lima::guest::provision_script;
+use crate::lima::guest::boot_script;
 
 use crate::lima::network::lima_network_name;
 
@@ -30,16 +30,26 @@ fn unsupported(what: &str) -> Error {
     Error::Unsupported { what: what.to_owned() }
 }
 
-/// Re-checks the rules that guard the host, so a driver called without
-/// [`Cells`](crate::Cells) still cannot publish a port or mount a folder.
-pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
+/// The spec's Lima options, once the rules that guard the host hold again,
+/// so a driver called without [`Cells`](crate::Cells) still cannot publish
+/// a port or mount a folder.
+fn lima_options(spec: &CellSpec) -> Result<&LimaOptions, Error> {
     crate::policy::check_spec(spec)?;
-    if spec.driver != DriverKind::Lima {
-        return Err(unsupported("a cell for another driver"));
+    if spec.parent.is_some() {
+        return Err(unsupported("a Lima cell inside another cell"));
     }
+    match &spec.kind {
+        Kind::Lima(options) => Ok(options),
+        _ => Err(unsupported("a cell of another kind")),
+    }
+}
+
+pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
+    let options = lima_options(spec)?;
     if spec.clone_from.is_some() {
         return Err(unsupported("cloning a cell"));
     }
+    let image = &options.image;
 
     let mut out = String::new();
     let mut line = |text: &str| {
@@ -49,11 +59,11 @@ pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
     line("# Written by adytum from a cell spec. Edit the spec, not this file.");
     line("minimumLimaVersion: 2.0.0");
     line("vmType: vz");
-    line(&format!("arch: {}", arch_name(spec.image.arch)));
+    line(&format!("arch: {}", arch_name(image.arch)));
     line("images:");
-    line(&format!("- location: {}", quoted(&spec.image.location)));
-    line(&format!("  arch: {}", arch_name(spec.image.arch)));
-    line(&format!("  digest: {}", quoted(&spec.image.digest)));
+    line(&format!("- location: {}", quoted(&image.location)));
+    line(&format!("  arch: {}", arch_name(image.arch)));
+    line(&format!("  digest: {}", quoted(&image.digest)));
     line(&format!("cpus: {}", spec.resources.cpus));
     line(&format!("memory: {}MiB", spec.resources.memory_mib));
     line(&format!("disk: {}GiB", spec.resources.disk_gib));
@@ -76,9 +86,14 @@ pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
         }
     }
 
+    // Rootful containerd from the archive Lima pins by digest, for
+    // container cells; never the rootless one Lima starts by default.
     line("containerd:");
-    line("  system: false");
+    line(&format!("  system: {}", options.containers));
     line("  user: false");
+    if options.nested_virtualization {
+        line("nestedVirtualization: true");
+    }
     line("ssh:");
     line("  forwardAgent: false");
     line("  loadDotSSHPubKeys: false");
@@ -95,7 +110,7 @@ pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
     line("provision:");
     line("- mode: system");
     line("  script: |");
-    for script_line in provision_script().lines() {
+    for script_line in script(options)?.lines() {
         if script_line.is_empty() {
             line("");
         } else {
@@ -125,10 +140,7 @@ pub(crate) fn render(spec: &CellSpec) -> Result<String, Error> {
 /// it never keeps a host port or folder only the source named. Disk stays:
 /// Lima can grow a disk but not shrink one.
 pub(crate) fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, Error> {
-    crate::policy::check_spec(spec)?;
-    if spec.driver != DriverKind::Lima {
-        return Err(unsupported("a cell for another driver"));
-    }
+    let options = lima_options(spec)?;
     let mut mounts = Vec::new();
     for m in if spec.sealed { &[][..] } else { &spec.mounts[..] } {
         let source = m.source.to_string_lossy();
@@ -149,6 +161,9 @@ pub(crate) fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, Error> {
         format!(".memory = \"{}MiB\"", spec.resources.memory_mib),
         format!(".mounts = {}", serde_json::Value::Array(mounts)),
         format!(".portForwards = {}", serde_json::Value::Array(forwards)),
+        format!(".containerd.system = {}", options.containers),
+        format!(".provision = {}", serde_json::json!([{ "mode": "system", "script": script(options)? }])),
+        format!(".nestedVirtualization = {}", options.nested_virtualization),
     ];
     if let Some(name) = network_for(spec) {
         edits.push(format!(".networks = {}", serde_json::json!([{ "lima": name }])));
@@ -156,12 +171,23 @@ pub(crate) fn clone_edits(spec: &CellSpec) -> Result<Vec<String>, Error> {
     Ok(edits)
 }
 
+fn script(options: &LimaOptions) -> Result<String, Error> {
+    let pin = if options.containers {
+        Some(crate::lima::gvisor(options.image.arch).ok_or_else(|| unsupported("containers on this architecture: no gVisor release is pinned for it"))?)
+    } else {
+        None
+    };
+    Ok(boot_script(pin.as_ref(), options.desktop))
+}
+
 /// Made from the cell's own wall, so a cell only ever joins its wall's network.
 pub(crate) fn network_for(spec: &CellSpec) -> Option<String> {
     spec.network.as_ref().map(|n| lima_network_name(&spec.wall, n))
 }
 
+// Lima cells need a Mac or Linux host.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::{ImagePin, Mount, Port, Resources, Wall};
@@ -170,17 +196,18 @@ mod tests {
     fn spec(sealed: bool) -> CellSpec {
         CellSpec {
             name: "adytum-test-tpl".parse().unwrap(),
-            driver: DriverKind::Lima,
-            image: ImagePin::new(
-                "https://cloud-images.ubuntu.com/releases/noble/release-20260518/ubuntu-24.04-server-cloudimg-arm64.img".into(),
-                "sha256:6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec".into(),
-                Arch::Aarch64,
-            )
-            .unwrap(),
+            kind: Kind::Lima(LimaOptions::new(
+                ImagePin::new(
+                    "https://cloud-images.ubuntu.com/releases/noble/release-20260518/ubuntu-24.04-server-cloudimg-arm64.img".into(),
+                    "sha256:6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec".into(),
+                    Arch::Aarch64,
+                )
+                .unwrap(),
+            )),
+            parent: None,
             wall: "wall_a".parse::<Wall>().unwrap(),
             resources: Resources::default(),
             ports: vec![],
-            automation_port: None,
             mounts: vec![],
             sealed,
             network: None,
@@ -239,17 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn the_automation_port_is_never_forwarded() {
-        let mut s = spec(true);
-        s.automation_port = Some(9222);
-        let text = render(&s).unwrap();
-        assert!(!text.contains("9222"));
-        s.ports.push(Port { guest: 9222, host: 9222, bind: "127.0.0.1".parse().unwrap() });
-        let Err(Error::Refused(r)) = render(&s) else { panic!("not refused") };
-        assert_eq!(r.code, crate::RefusalCode::AutomationPortPublished);
-    }
-
-    #[test]
     fn the_host_user_is_not_copied_into_the_guest() {
         let text = render(&spec(true)).unwrap();
         assert!(text.contains("user:\n  name: adytum\n  comment: \"\"\n"));
@@ -284,6 +300,55 @@ mod tests {
         let mut s = spec(true);
         s.clone_from = Some("adytum-other".parse().unwrap());
         assert!(matches!(render(&s), Err(Error::Unsupported { .. })));
+        let mut s = spec(true);
+        s.parent = Some("adytum-other".parse().unwrap());
+        assert!(matches!(render(&s), Err(Error::Unsupported { .. })));
+        assert!(matches!(clone_edits(&s), Err(Error::Unsupported { .. })));
+        s.parent = None;
+        s.kind = Kind::OpenShell;
+        assert!(matches!(render(&s), Err(Error::Unsupported { .. })));
+    }
+
+    fn with(containers: bool, nested_virtualization: bool) -> CellSpec {
+        let mut s = spec(true);
+        if let Kind::Lima(options) = &mut s.kind {
+            options.containers = containers;
+            options.nested_virtualization = nested_virtualization;
+        }
+        s
+    }
+
+    #[test]
+    fn containerd_runs_as_root_only_when_the_cell_holds_containers() {
+        let text = render(&with(false, false)).unwrap();
+        assert!(text.contains("containerd:\n  system: false\n  user: false\n"), "{text}");
+        assert!(!text.contains("nestedVirtualization"), "{text}");
+        let text = render(&with(true, false)).unwrap();
+        assert!(text.contains("containerd:\n  system: true\n  user: false\n"), "{text}");
+    }
+
+    #[test]
+    fn a_cell_that_holds_containers_installs_gvisor_after_the_firewall() {
+        let text = render(&with(true, false)).unwrap();
+        assert_eq!(text.matches("- mode: system\n  script: |\n").count(), 1, "{text}");
+        let firewall = text.find("table inet adytum").unwrap();
+        let gvisor = text.find("sha256sum -c").unwrap();
+        assert!(firewall < gvisor && gvisor < text.find("portForwards:").unwrap());
+        assert!(!render(&with(false, false)).unwrap().contains("gvisor"));
+        let edits = clone_edits(&with(true, false)).unwrap();
+        let provision = edits.iter().find(|e| e.starts_with(".provision = ")).unwrap();
+        assert!(provision.contains("sha256sum -c") && provision.contains("table inet adytum"), "{provision}");
+        assert!(!clone_edits(&with(false, false)).unwrap().iter().any(|e| e.contains("gvisor")));
+    }
+
+    #[test]
+    fn nested_virtualization_is_written_only_when_asked() {
+        let text = render(&with(false, true)).unwrap();
+        assert!(text.contains("\nnestedVirtualization: true\n"), "{text}");
+        let edits = clone_edits(&with(true, true)).unwrap();
+        assert!(edits.contains(&".containerd.system = true".to_owned()) && edits.contains(&".nestedVirtualization = true".to_owned()), "{edits:?}");
+        let edits = clone_edits(&with(false, false)).unwrap();
+        assert!(edits.contains(&".containerd.system = false".to_owned()) && edits.contains(&".nestedVirtualization = false".to_owned()), "{edits:?}");
     }
 
     #[test]
