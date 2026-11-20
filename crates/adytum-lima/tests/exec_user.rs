@@ -9,7 +9,10 @@ use adytum_model::CellName;
 use adytum_testkit::{Call, FakeRunner, Transcript};
 
 fn lima(calls: &[&[&str]]) -> (Lima, Arc<FakeRunner>, std::path::PathBuf) {
-    let home = std::path::PathBuf::from("/tmp").join(format!("adl-u-{}", std::process::id()));
+    // A folder per test: the tests run in parallel and each removes its own.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let home = std::path::PathBuf::from("/tmp").join(format!("adl-u-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&home).expect("a scratch folder");
     let calls =
         calls.iter().map(|argv| Call { argv: argv.iter().map(|a| (*a).to_owned()).collect(), stdin: None, stdout: String::new(), stderr: String::new(), status: 0 }).collect();
