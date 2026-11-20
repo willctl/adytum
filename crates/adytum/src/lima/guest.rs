@@ -69,6 +69,7 @@ own=$(ip -4 -o route show scope link | awk '$1 ~ /^[0-9.]+\/[0-9]+$/ { print $1 
   echo "  }"
   echo "  chain forward {"
   echo "    type filter hook forward priority 0; policy accept;"
+  echo "    ct state established,related accept"
   echo "    jump guard"
   echo "  }"
   echo "}"
@@ -141,7 +142,19 @@ mod tests {
     #[test]
     fn replies_to_the_hosts_connections_are_told_apart_by_the_syn_flag_not_by_conntrack() {
         // A connection the host opened (Lima's ssh) may be older than the rules.
-        assert!(!open().contains("ct state"));
+        let script = open();
+        let output = &script[at(&script, "chain output {")..at(&script, "chain forward {")];
+        assert!(!output.contains("ct state"), "{output}");
+    }
+
+    #[test]
+    fn a_container_gets_its_replies_and_its_new_connections_meet_the_guard() {
+        // A container's connection out is new when it is forwarded, so the
+        // guard sees it; only what comes back is let through by state.
+        let script = open();
+        let forward = &script[at(&script, "chain forward {")..];
+        assert!(at(forward, "ct state established,related accept") < at(forward, "jump guard"), "{forward}");
+        assert!(!forward.contains("ct state new"), "{forward}");
     }
 
     #[test]
