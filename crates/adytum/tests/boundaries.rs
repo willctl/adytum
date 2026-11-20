@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adytum::container::Oci;
+#[cfg(unix)]
 use adytum::lima::Lima;
 use adytum::testing::{failed, ok, FakeDriver, FakeRunner};
 use adytum::*;

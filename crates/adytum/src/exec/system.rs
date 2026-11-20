@@ -2,6 +2,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
@@ -81,7 +82,15 @@ async fn stop(child: &mut Child, pgid: Option<u32>, grace: Duration) {
 /// writes more is stopped, since its output is held in memory.
 pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
-fn spawn_reader<R>(mut stream: R, over: Arc<Notify>) -> JoinHandle<Vec<u8>>
+/// Set by a reader that went past [`MAX_OUTPUT`]. The flag, not the notice,
+/// decides: a command whose pipe closed may exit before the notice is seen.
+#[derive(Default)]
+struct Over {
+    hit: AtomicBool,
+    notice: Notify,
+}
+
+fn spawn_reader<R>(mut stream: R, over: Arc<Over>) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -92,7 +101,8 @@ where
             match stream.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) if all.len() + n > MAX_OUTPUT => {
-                    over.notify_one();
+                    over.hit.store(true, Ordering::SeqCst);
+                    over.notice.notify_one();
                     break;
                 }
                 Ok(n) => all.extend_from_slice(&buf[..n]),
@@ -129,7 +139,7 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
     if let (Some(bytes), Some(pipe)) = (cmd.stdin(), child.stdin.take()) {
         tokio::spawn(write_stdin(pipe, bytes.to_vec()));
     }
-    let over = Arc::new(Notify::new());
+    let over = Arc::new(Over::default());
     let out = child.stdout.take().map(|s| spawn_reader(s, over.clone()));
     let err = child.stderr.take().map(|s| spawn_reader(s, over.clone()));
 
@@ -140,11 +150,10 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
         }
     };
     let mut timed_out = false;
-    let mut too_much = false;
     let status = tokio::select! {
         waited = child.wait() => Some(waited.map_err(|source| Error::Child { what: "wait for the command", source })?),
         () = deadline => { timed_out = true; None }
-        () = over.notified() => { too_much = true; None }
+        () = over.notice.notified() => None,
     };
     let code = match status {
         Some(s) => s.code(),
@@ -155,7 +164,7 @@ async fn drive(grace: Duration, cmd: &Command) -> Result<Output, Error> {
     };
     let stdout = collect(out, status.is_some()).await;
     let stderr = collect(err, status.is_some()).await;
-    if too_much {
+    if over.hit.load(Ordering::SeqCst) {
         return Err(Error::Tool {
             what: cmd.program().to_string_lossy().into_owned(),
             status: None,
