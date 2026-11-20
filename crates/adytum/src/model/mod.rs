@@ -4,6 +4,7 @@ mod refusal;
 mod spec;
 
 pub use ids::CellId;
-pub use names::{CellName, GuestUser, NetworkName, Wall};
+pub use names::{CellName, GuestUser, NetworkName, OciImage, Wall};
 pub use refusal::{Refusal, RefusalCode};
-pub use spec::{Arch, Cell, CellSpec, CellState, DriverKind, ImagePin, Mount, Port, Resources};
+pub use spec::{Arch, Cell, CellSpec, CellState, ContainerOptions, ImagePin, Kind, KindName, LimaOptions, Mount, Port, Resources};
+pub(crate) mod tree;

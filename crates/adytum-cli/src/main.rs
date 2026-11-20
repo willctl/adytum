@@ -5,15 +5,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adytum::lima::Lima;
-
-use adytum::Driver;
+use adytum::{Drivers, SystemDrivers};
 use serde_json::{json, Value};
 
 use args::USAGE;
 
 struct Context {
-    driver: Arc<dyn Driver>,
+    drivers: Arc<dyn Drivers>,
     home: PathBuf,
 }
 
@@ -106,8 +104,7 @@ fn main() {
 
 fn start(tokens: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let home = adytum::home().ok_or("Could not find a home folder for Adytum. Set ADYTUM_HOME to a short absolute path.")?;
-    let lima = Lima::system(adytum::lima::lima_home_in(&home)).map_err(|e| e.to_string())?;
-    let ctx = Context { driver: Arc::new(lima), home };
+    let ctx = Context { drivers: Arc::new(SystemDrivers::new(adytum::lima::lima_home_in(&home))), home };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("Could not start the async runtime: {e}. Try again."))?;
     Ok(runtime.block_on(run(tokens, &ctx, out, err)))
 }

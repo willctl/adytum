@@ -4,9 +4,12 @@ mod cells;
 mod driver;
 mod error;
 pub mod exec;
+mod host;
 mod model;
 pub mod policy;
 
+#[cfg(feature = "container")]
+pub mod container;
 #[cfg(feature = "doctor")]
 pub mod doctor;
 #[cfg(feature = "lima")]
@@ -19,4 +22,5 @@ pub mod testing;
 pub use cells::{home, Cells, Report};
 pub use driver::*;
 pub use error::{Error, Result};
+pub use host::*;
 pub use model::*;

@@ -248,7 +248,7 @@ fn sealed_cell(before: &[String]) {
             use adytum::Driver;
             let lima = adytum::lima::Lima::system(adytum::lima::lima_home_in(&env.home)).unwrap();
             let cell: adytum::CellName = name.parse().unwrap();
-            let mut duplex = lima.stream(&cell, &["cat".to_owned()]).await.unwrap();
+            let mut duplex = lima.stream(&cell, &["cat".to_owned()], adytum::ExecOpts::default()).await.unwrap();
             duplex.write_all(b"through the stream\n").await.unwrap();
             duplex.shutdown().await.unwrap();
             let mut got = String::new();
@@ -508,8 +508,8 @@ impl Drop for NetGuard {
 fn net_spec(name: &str, wall: &str, network: &str) -> adytum::CellSpec {
     adytum::CellSpec {
         name: name.parse().unwrap(),
-        driver: adytum::DriverKind::Lima,
-        image: adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap(),
+        kind: adytum::Kind::Lima(adytum::LimaOptions::new(adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap())),
+        parent: None,
         wall: wall.parse().unwrap(),
         resources: adytum::Resources { cpus: 1, memory_mib: 1024, ..adytum::Resources::default() },
         ports: vec![],

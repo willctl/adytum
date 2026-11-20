@@ -170,8 +170,8 @@ impl Drop for Home {
 fn spec(name: &str) -> CellSpec {
     CellSpec {
         name: name.parse().unwrap(),
-        driver: adytum::DriverKind::Lima,
-        image: adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap(),
+        kind: adytum::Kind::Lima(adytum::LimaOptions::new(adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap())),
+        parent: None,
         wall: "wall_fw".parse().unwrap(),
         resources: Resources { cpus: 1, memory_mib: 1024, ..Resources::default() },
         ports: vec![],

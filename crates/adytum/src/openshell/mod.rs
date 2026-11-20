@@ -173,12 +173,19 @@ impl Driver for OpenShell {
         Ok(out)
     }
 
-    async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, Error> {
+    async fn stream(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Duplex, Error> {
         let sandbox = sandbox_name(name)?;
         if argv.is_empty() {
             return Err(refuse("an empty command"));
         }
-        let cmd = self.command(&exec(&sandbox, None, argv))?;
+        if opts.root || opts.stdin.is_some() {
+            return Err(refuse("a stream as root or with stdin bytes (OpenShell runs a sandbox's commands as its own user; write to the stream)"));
+        }
+        let full = crate::command_line(argv, &opts.env)?;
+        let mut cmd = self.command(&exec(&sandbox, None, &full))?;
+        if let Some(d) = opts.deadline {
+            cmd = cmd.deadline(d);
+        }
         Ok(self.runner.duplex(&cmd).await?)
     }
 

@@ -1,9 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-use crate::{Arch, Cell, CellId, CellName, CellSpec, CellState, DriverKind, ImagePin, Mount, NetworkName, Port, Refusal, RefusalCode, Resources};
+use crate::{Arch, Cell, CellId, CellName, CellSpec, CellState, ImagePin, Kind, LimaOptions, Mount, NetworkName, Port, Refusal, RefusalCode, Resources};
 use proptest::prelude::*;
 
+use crate::model::tree::MAX_DEPTH;
 use crate::policy::*;
 
 fn name(s: &str) -> CellName {
@@ -13,8 +14,8 @@ fn name(s: &str) -> CellName {
 fn spec(n: &str, wall: &str) -> CellSpec {
     CellSpec {
         name: name(n),
-        driver: DriverKind::Lima,
-        image: ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64).unwrap(),
+        kind: Kind::Lima(LimaOptions::new(ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64).unwrap())),
+        parent: None,
         wall: wall.parse().unwrap(),
         resources: Resources::default(),
         ports: vec![],
@@ -190,6 +191,106 @@ fn check_create_passes_a_clean_spec_and_reports_the_first_refusal() {
     assert_eq!(code(check_create(&s, &w)), RefusalCode::PortNotLocalhost);
     s.ports.clear();
     assert_eq!(code(check_create(&s, &w)), RefusalCode::NameTaken);
+}
+
+fn host(n: &str, wall: &str) -> Cell {
+    let mut c = cell(n, wall);
+    if let Kind::Lima(options) = &mut c.spec.kind {
+        options.containers = true;
+    }
+    c
+}
+
+fn container(n: &str, wall: &str, parent: &str) -> CellSpec {
+    let image = format!("docker.io/library/alpine@sha256:{}", "0".repeat(64)).parse().unwrap();
+    CellSpec { kind: Kind::Container(crate::ContainerOptions { image }), parent: Some(name(parent)), ..spec(n, wall) }
+}
+
+#[test]
+fn a_cell_in_a_parent_that_can_hold_it_passes() {
+    let mut sealed_host = host("adytum-p", "wall_a");
+    sealed_host.spec.sealed = true;
+    let mut child = container("adytum-c", "wall_a", "adytum-p");
+    child.sealed = true;
+    assert!(check_create(&child, &[sealed_host]).is_ok());
+    let unsealed_child = container("adytum-c", "wall_a", "adytum-p");
+    assert!(check_create(&unsealed_child, &[host("adytum-p", "wall_a")]).is_ok());
+    let mut sealed_child = unsealed_child.clone();
+    sealed_child.sealed = true;
+    assert!(check_create(&sealed_child, &[host("adytum-p", "wall_a")]).is_ok(), "a sealed child of an open parent");
+}
+
+#[test]
+fn a_parent_that_is_not_recorded_is_refused() {
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[])), RefusalCode::ParentMissing);
+}
+
+#[test]
+fn a_child_behind_another_wall_than_its_parent_is_refused() {
+    assert_eq!(code(check_create(&container("adytum-c", "wall_b", "adytum-p"), &[host("adytum-p", "wall_a")])), RefusalCode::ParentWall);
+}
+
+#[test]
+fn a_parent_that_cannot_run_the_childs_kind_is_refused() {
+    // A Lima cell without containers, a Lima cell in a Lima cell, a container in a container.
+    let plain = cell("adytum-p", "wall_a");
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[plain])), RefusalCode::ParentCannotHost);
+    let vm_in_vm = CellSpec { parent: Some(name("adytum-p")), ..spec("adytum-c", "wall_a") };
+    assert_eq!(code(check_create(&vm_in_vm, &[host("adytum-p", "wall_a")])), RefusalCode::ParentCannotHost);
+    let inner = Cell { id: CellId::from_bytes([1; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Running };
+    let refused = check_create(&container("adytum-d", "wall_a", "adytum-c"), &[host("adytum-p", "wall_a"), inner]);
+    let r = refused.err().unwrap();
+    assert_eq!(r.code, RefusalCode::ParentCannotHost);
+    assert!(r.message.contains("container") && !r.fix.is_empty(), "{r:?}");
+}
+
+#[test]
+fn a_sealed_parent_holds_only_sealed_cells() {
+    let mut p = host("adytum-p", "wall_a");
+    p.spec.sealed = true;
+    assert_eq!(code(check_create(&container("adytum-c", "wall_a", "adytum-p"), &[p])), RefusalCode::ParentSealed);
+}
+
+#[test]
+fn a_nested_cell_publishes_no_port_and_mounts_nothing_even_on_loopback() {
+    let mut s = container("adytum-c", "wall_a", "adytum-p");
+    s.ports = vec![port(80, Ipv4Addr::LOCALHOST.into())];
+    assert_eq!(code(check_spec(&s)), RefusalCode::NestedPort);
+    s.ports.clear();
+    s.mounts = vec![mount("/work/a")];
+    assert_eq!(code(check_spec(&s)), RefusalCode::NestedMount);
+    assert_eq!(code(check_create(&s, &[host("adytum-p", "wall_a")])), RefusalCode::NestedMount, "before the parent is even looked at");
+}
+
+#[test]
+fn a_cell_too_deep_is_refused() {
+    // Hosts that could hold anything, three deep: the fourth level is refused.
+    let mut cells = vec![host("adytum-l0", "wall_a")];
+    for i in 1..MAX_DEPTH {
+        let mut c = host(&format!("adytum-l{i}"), "wall_a");
+        c.spec.parent = Some(name(&format!("adytum-l{}", i - 1)));
+        cells.push(c);
+    }
+    let deepest = format!("adytum-l{}", MAX_DEPTH - 1);
+    assert!(check_create(&container("adytum-c", "wall_a", &deepest), &cells).is_ok());
+    let mut c = host("adytum-c", "wall_a");
+    c.spec.parent = Some(name(&deepest));
+    cells.push(c);
+    assert_eq!(code(check_create(&container("adytum-d", "wall_a", "adytum-c"), &cells)), RefusalCode::TooDeep);
+}
+
+#[test]
+fn a_clone_is_made_where_its_source_runs() {
+    let source = Cell { id: CellId::from_bytes([2; 16]), spec: container("adytum-c", "wall_a", "adytum-p"), state: CellState::Stopped };
+    let cells = [host("adytum-p", "wall_a"), host("adytum-q", "wall_a"), source];
+    let mut copy = container("adytum-d", "wall_a", "adytum-q");
+    copy.clone_from = Some(name("adytum-c"));
+    assert_eq!(code(check_create(&copy, &cells)), RefusalCode::CloneHost);
+    copy.parent = Some(name("adytum-p"));
+    assert!(check_create(&copy, &cells).is_ok());
+    let mut from_machine = spec("adytum-e", "wall_a");
+    from_machine.clone_from = Some(name("adytum-c"));
+    assert_eq!(code(check_create(&from_machine, &cells)), RefusalCode::CloneHost);
 }
 
 proptest! {

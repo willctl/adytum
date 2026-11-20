@@ -1,27 +1,28 @@
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Cell, CellName, CellSpec, Refusal, RefusalCode};
+use crate::model::tree::{ancestors, find, MAX_DEPTH};
+use crate::{Cell, CellSpec, Refusal, RefusalCode};
 
 /// The rules a spec must keep on its own, whatever else exists: the ones
 /// that guard the host. A driver checks these again before it writes
 /// anything.
 pub fn check_spec(spec: &CellSpec) -> Result<(), Refusal> {
     ports_on_localhost(spec)?;
-    sealed_has_no_mounts(spec)
+    nested_publishes_nothing(spec)?;
+    sealed_has_no_mounts(spec)?;
+    nested_mounts_nothing(spec)
 }
 
 /// Every rule against the cells that exist; the first refusal wins.
 pub fn check_create(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
     check_spec(spec)?;
     name_free(spec, cells)?;
+    parent_can_hold_it(spec, cells)?;
     walls_share_no_network(spec, cells)?;
     walls_share_no_mount(spec, cells)?;
-    walls_share_no_clone_source(spec, cells)
-}
-
-fn find<'a>(cells: &'a [Cell], name: &CellName) -> Option<&'a Cell> {
-    cells.iter().find(|c| &c.spec.name == name)
+    walls_share_no_clone_source(spec, cells)?;
+    clone_on_the_same_host(spec, cells)
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
@@ -42,6 +43,30 @@ fn ports_on_localhost(spec: &CellSpec) -> Result<(), Refusal> {
     }
 }
 
+/// A nested cell's ports would be published inside its parent, which no
+/// rule here can see.
+fn nested_publishes_nothing(spec: &CellSpec) -> Result<(), Refusal> {
+    match (&spec.parent, spec.ports.first()) {
+        (Some(parent), Some(p)) => Err(Refusal::new(
+            RefusalCode::NestedPort,
+            format!("{} runs in {parent}, so it cannot publish port {}.", spec.name, p.guest),
+            "Remove the ports; reach a nested cell through exec or a stream.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn nested_mounts_nothing(spec: &CellSpec) -> Result<(), Refusal> {
+    match (&spec.parent, spec.mounts.first()) {
+        (Some(parent), Some(m)) => Err(Refusal::new(
+            RefusalCode::NestedMount,
+            format!("{} runs in {parent}, so it cannot mount {} from this machine.", spec.name, m.source.display()),
+            "Remove the mounts, and copy the files in instead.",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn sealed_has_no_mounts(spec: &CellSpec) -> Result<(), Refusal> {
     if spec.sealed && !spec.mounts.is_empty() {
         return Err(Refusal::new(RefusalCode::SealedCellMount, "A sealed cell cannot have mounts from the host.", "Remove the mounts, or make the cell not sealed."));
@@ -54,6 +79,64 @@ fn name_free(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
         return Err(Refusal::new(RefusalCode::NameTaken, format!("A cell named {} already exists.", spec.name), "Pick another name, or remove that cell first."));
     }
     Ok(())
+}
+
+/// The parent exists, keeps the same wall, can run this kind of cell, is not
+/// sealed unless the child is, and is not too deep already.
+fn parent_can_hold_it(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
+    let Some(name) = &spec.parent else { return Ok(()) };
+    let Some(parent) = find(cells, name) else {
+        return Err(Refusal::new(
+            RefusalCode::ParentMissing,
+            format!("There is no cell named {name} for {} to run in.", spec.name),
+            "Create the parent cell first, or leave the parent out.",
+        ));
+    };
+    if parent.spec.wall != spec.wall {
+        return Err(Refusal::new(
+            RefusalCode::ParentWall,
+            format!("{} would be behind {}, but its parent {name} is behind {}.", spec.name, spec.wall, parent.spec.wall),
+            "Give the cell its parent's wall.",
+        ));
+    }
+    if !parent.spec.kind.hosts(spec.kind.name()) {
+        return Err(Refusal::new(
+            RefusalCode::ParentCannotHost,
+            format!("{name} cannot run a {} cell.", kind_word(spec)),
+            "Pick a parent that can, such as a Lima cell made with containers on for a container.",
+        ));
+    }
+    if parent.spec.sealed && !spec.sealed {
+        return Err(Refusal::new(RefusalCode::ParentSealed, format!("{name} is sealed, so {} must be sealed too.", spec.name), "Make the cell sealed."));
+    }
+    let depth = ancestors(cells, name).len() + 1;
+    if depth > MAX_DEPTH {
+        return Err(Refusal::new(
+            RefusalCode::TooDeep,
+            format!("{} would run {depth} cells deep; at most {MAX_DEPTH} cells may stand between this machine and a cell.", spec.name),
+            "Run it in a parent nearer this machine.",
+        ));
+    }
+    Ok(())
+}
+
+fn kind_word(spec: &CellSpec) -> &'static str {
+    match spec.kind.name() {
+        crate::KindName::Lima => "Lima",
+        crate::KindName::Container => "container",
+        crate::KindName::OpenShell => "OpenShell",
+    }
+}
+
+fn clone_on_the_same_host(spec: &CellSpec, cells: &[Cell]) -> Result<(), Refusal> {
+    match spec.clone_from.as_ref().and_then(|n| find(cells, n)) {
+        Some(source) if source.spec.parent != spec.parent => Err(Refusal::new(
+            RefusalCode::CloneHost,
+            format!("{} runs somewhere else than {} would, and a clone is made where its source is.", source.spec.name, spec.name),
+            "Give the clone its source's parent.",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn others<'a>(spec: &'a CellSpec, cells: &'a [Cell]) -> impl Iterator<Item = &'a Cell> {

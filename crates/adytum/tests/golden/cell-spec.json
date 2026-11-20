@@ -1,11 +1,17 @@
 {
   "name": "adytum-demo",
-  "driver": "lima",
-  "image": {
-    "location": "https://example.test/images/base-aarch64.img",
-    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "arch": "aarch64"
+  "kind": {
+    "lima": {
+      "image": {
+        "location": "https://example.test/images/base-aarch64.img",
+        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "arch": "aarch64"
+      },
+      "containers": true,
+      "nested_virtualization": false
+    }
   },
+  "parent": null,
   "wall": "wall_team-a",
   "resources": {
     "cpus": 2,

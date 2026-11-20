@@ -9,7 +9,7 @@ use std::sync::Arc;
 use adytum::exec::Output;
 use adytum::lima::Lima;
 use adytum::testing::{failed, ok, FakeRunner};
-use adytum::{CellName, CellSpec, CellState, Driver, DriverKind, Error, ExecOpts, Port, RefusalCode, Resources};
+use adytum::{CellName, CellSpec, CellState, Driver, Error, ExecOpts, Kind, LimaOptions, Port, RefusalCode, Resources};
 
 const NAME: &str = "adytum-test-golden";
 
@@ -20,8 +20,8 @@ fn name() -> CellName {
 fn spec() -> CellSpec {
     CellSpec {
         name: name(),
-        driver: DriverKind::Lima,
-        image: adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap(),
+        kind: Kind::Lima(LimaOptions::new(adytum::lima::image(adytum::lima::DEFAULT_IMAGE).unwrap())),
+        parent: None,
         wall: "wall_test".parse().unwrap(),
         resources: Resources::default(),
         ports: vec![],
@@ -298,7 +298,20 @@ async fn a_clone_asks_for_the_specs_settings_and_needs_a_stopped_free_source() {
     let (lima, fake, _home) = lima(FakeRunner::replies(vec![listed(&[(NAME, "Stopped")]), ok(""), listed(&[(NAME, "Running")]), both, ok("")]));
     lima.clone_cell(&name(), &clone_spec()).await.unwrap();
     let forwards = r#".portForwards = [{"guestPort":8080,"hostPort":18080,"hostIP":"127.0.0.1","proto":"tcp"},{"guestIP":"127.0.0.1","proto":"any","guestPortRange":[1,65535],"ignore":true},{"guestIP":"0.0.0.0","proto":"any","guestPortRange":[1,65535],"ignore":true},{"guestIP":"::","proto":"any","guestPortRange":[1,65535],"ignore":true}]"#;
-    let set = ["--set", ".cpus = 2", "--set", ".memory = \"2048MiB\"", "--set", ".mounts = []", "--set", forwards];
+    let set = [
+        "--set",
+        ".cpus = 2",
+        "--set",
+        ".memory = \"2048MiB\"",
+        "--set",
+        ".mounts = []",
+        "--set",
+        forwards,
+        "--set",
+        ".containerd.system = false",
+        "--set",
+        ".nestedVirtualization = false",
+    ];
     assert_eq!(fake.argv()[1], argv(&[&["limactl", "clone", "--tty=false"][..], &set, &[NAME, "adytum-test-golden-clone"]].concat()));
     assert!(matches!(lima.clone_cell(&name(), &clone_spec()).await, Err(Error::Unsupported { .. })), "a running source");
     assert!(matches!(lima.clone_cell(&name(), &clone_spec()).await, Err(Error::Refused(r)) if r.code == RefusalCode::NameTaken));

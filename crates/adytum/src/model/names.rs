@@ -138,6 +138,27 @@ string_newtype!(
     }
 );
 
+string_newtype!(
+    /// A container image pinned by its digest: a reference such as
+    /// `docker.io/library/alpine:3.22`, then `@sha256:` and 64 lowercase hex
+    /// characters. A tag alone can move, so it is not enough.
+    OciImage,
+    |_, rule| Error::Invalid { what: "container image", rule },
+    |t| {
+        let (reference, digest) = t.split_once("@sha256:").ok_or("a reference, @sha256: and the digest")?;
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("64 lowercase hex characters after @sha256:");
+        }
+        if reference.is_empty() || reference.len() > 255 {
+            return Err("a reference of 1 to 255 characters before the digest");
+        }
+        if !reference.starts_with(is_lower_alnum) || !reference.chars().all(|c| is_lower_alnum(c) || matches!(c, '.' | '_' | '-' | '/' | ':')) {
+            return Err("a reference of a-z, 0-9, ., _, -, / and :, starting with a letter or digit");
+        }
+        Ok(())
+    }
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +199,27 @@ mod tests {
         }
         for bad in ["", "Root", "1user", "-u", "a b", "a:b", "a/b", "a.b", "user$", "../root", &"a".repeat(33)] {
             assert!(bad.parse::<GuestUser>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_container_image_is_pinned_by_its_digest() {
+        let digest = "0123456789abcdef".repeat(4);
+        for ok in [format!("alpine@sha256:{digest}"), format!("docker.io/library/alpine:3.22@sha256:{digest}"), format!("registry.test:5000/a/b_c-d.e@sha256:{digest}")] {
+            assert!(ok.parse::<OciImage>().is_ok(), "{ok}");
+        }
+        for bad in [
+            "alpine".to_owned(),
+            "alpine:3.22".to_owned(),
+            format!("alpine@sha256:{}", &digest[1..]),
+            format!("alpine@sha256:{}", digest.to_uppercase()),
+            format!("alpine@sha512:{digest}"),
+            format!("@sha256:{digest}"),
+            format!("-alpine@sha256:{digest}"),
+            format!("Alpine@sha256:{digest}"),
+            format!("alp ine@sha256:{digest}"),
+        ] {
+            assert!(bad.parse::<OciImage>().is_err(), "{bad}");
         }
     }
 

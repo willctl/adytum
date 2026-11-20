@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncWrite, DuplexStream};
 
 use crate::exec::{Command, Duplex, DuplexControl, Output, Runner};
-use crate::{CellName, CellSpec, CellState, Driver, Error, ExecOpts, GuestUser, Listed};
+use crate::{CellName, CellSpec, CellState, Driver, Drivers, Error, ExecOpts, GuestUser, Host, KindName, Listed};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -168,6 +168,7 @@ pub enum DriverCall {
     Stream {
         cell: CellName,
         argv: Vec<String>,
+        root: bool,
     },
     CopyIn {
         cell: CellName,
@@ -187,7 +188,7 @@ impl fmt::Display for DriverCall {
         match self {
             Self::Life(op, cell) => write!(f, "{} {cell}", format!("{op:?}").to_lowercase()),
             Self::Exec(e) => write!(f, "exec {}{} {}", e.cell, if e.root { " (root)" } else { "" }, e.argv.join(" ")),
-            Self::Stream { cell, argv } => write!(f, "stream {cell} {}", argv.join(" ")),
+            Self::Stream { cell, argv, root } => write!(f, "stream {cell}{} {}", if *root { " (root)" } else { "" }, argv.join(" ")),
             Self::CopyIn { cell, host, guest, owner } => {
                 write!(f, "copy_in {cell} {} {guest}", host.display())?;
                 owner.as_ref().map_or(Ok(()), |o| write!(f, " (owner {o})"))
@@ -197,8 +198,8 @@ impl fmt::Display for DriverCall {
     }
 }
 
-type ExecAnswer = Box<dyn FnMut(&Exec) -> Output + Send>;
-type StreamAnswer = Box<dyn FnMut(&[String]) -> Result<Duplex, Error> + Send>;
+type ExecAnswer = Arc<Mutex<Option<Box<dyn FnMut(&Exec) -> Output + Send>>>>;
+type StreamAnswer = Arc<Mutex<Option<Box<dyn FnMut(&[String]) -> Result<Duplex, Error> + Send>>>>;
 
 #[derive(Default)]
 struct FakeState {
@@ -213,12 +214,19 @@ struct FakeState {
 /// otherwise, and streams are unsupported unless [`FakeDriver::on_stream`]
 /// supplies them. Copies only record what was asked, unless the driver was
 /// made with [`FakeDriver::in_folders`].
-#[derive(Default)]
+///
+/// It is also [`Drivers`] for every kind: the driver it gives for a host
+/// shares its cells, lists only the cells whose spec names that host as
+/// their parent, and fails every call while the host is not running.
+/// Removing or stopping a cell takes the cells inside it along, as a VM's
+/// containers go with the VM.
+#[derive(Default, Clone)]
 pub struct FakeDriver {
-    state: Mutex<FakeState>,
-    exec: Mutex<Option<ExecAnswer>>,
-    stream: Mutex<Option<StreamAnswer>>,
+    state: Arc<Mutex<FakeState>>,
+    exec: ExecAnswer,
+    stream: StreamAnswer,
     folders: Option<PathBuf>,
+    host: Option<CellName>,
 }
 
 impl FakeDriver {
@@ -247,12 +255,12 @@ impl FakeDriver {
 
     /// How `exec` answers.
     pub fn on_exec(&self, answer: impl FnMut(&Exec) -> Output + Send + 'static) {
-        *lock(&self.exec) = Some(Box::new(answer));
+        *lock(&*self.exec) = Some(Box::new(answer));
     }
 
     /// What `stream` returns, given the command's argv.
     pub fn on_stream(&self, answer: impl FnMut(&[String]) -> Result<Duplex, Error> + Send + 'static) {
-        *lock(&self.stream) = Some(Box::new(answer));
+        *lock(&*self.stream) = Some(Box::new(answer));
     }
 
     /// Makes the next call of `op` fail, leaving what `leaves` says.
@@ -281,10 +289,34 @@ impl FakeDriver {
         lock(&self.state).calls.clone()
     }
 
-    /// Records the call, then refuses it if the cell does not exist.
+    fn reach(&self, st: &FakeState) -> Result<(), Error> {
+        match &self.host {
+            Some(host) if st.cells.get(host) != Some(&CellState::Running) => {
+                Err(Error::Tool { what: format!("the fake driver in {host}"), status: Some(1), stderr: format!("{host} is not running") })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Every cell recorded as running in `name`, at any depth.
+    fn inside(st: &FakeState, name: &CellName) -> Vec<CellName> {
+        let mut found: Vec<CellName> = Vec::new();
+        let mut parents = vec![name.clone()];
+        while !parents.is_empty() {
+            let next: Vec<CellName> =
+                st.specs.values().filter(|s| s.parent.as_ref().is_some_and(|p| parents.contains(p)) && !found.contains(&s.name)).map(|s| s.name.clone()).collect();
+            found.extend(next.iter().cloned());
+            parents = next;
+        }
+        found
+    }
+
+    /// Records the call, then refuses it if the host is down or the cell
+    /// does not exist.
     fn ask(&self, name: &CellName, call: DriverCall) -> Result<(), Error> {
         let mut st = lock(&self.state);
         st.calls.push(call);
+        self.reach(&st)?;
         if st.cells.contains_key(name) {
             Ok(())
         } else {
@@ -295,6 +327,7 @@ impl FakeDriver {
     fn step(&self, op: Op, name: &CellName, work: impl FnOnce(&mut FakeState) -> Result<(), Error>) -> Result<(), Error> {
         let mut st = lock(&self.state);
         st.calls.push(DriverCall::Life(op, name.clone()));
+        self.reach(&st)?;
         let Some(at) = st.faults.iter().position(|(o, _)| *o == op) else { return work(&mut st) };
         let (_, leaves) = st.faults.remove(at);
         match leaves {
@@ -371,15 +404,15 @@ impl Driver for FakeDriver {
     async fn exec(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Output, Error> {
         let exec = Exec { cell: name.clone(), argv: argv.to_vec(), env: opts.env.into_iter().collect(), stdin: opts.stdin.unwrap_or_default(), root: opts.root };
         self.ask(name, DriverCall::Exec(exec.clone()))?;
-        Ok(match lock(&self.exec).as_mut() {
+        Ok(match lock(&*self.exec).as_mut() {
             Some(answer) => answer(&exec),
             None => ok(&argv.join(" ")),
         })
     }
 
-    async fn stream(&self, name: &CellName, argv: &[String]) -> Result<Duplex, Error> {
-        self.ask(name, DriverCall::Stream { cell: name.clone(), argv: argv.to_vec() })?;
-        match lock(&self.stream).as_mut() {
+    async fn stream(&self, name: &CellName, argv: &[String], opts: ExecOpts) -> Result<Duplex, Error> {
+        self.ask(name, DriverCall::Stream { cell: name.clone(), argv: argv.to_vec(), root: opts.root })?;
+        match lock(&*self.stream).as_mut() {
             Some(answer) => answer(argv),
             None => Err(Error::Unsupported { what: "a stream in the fake driver".to_owned() }),
         }
@@ -396,12 +429,22 @@ impl Driver for FakeDriver {
     }
 
     async fn stop(&self, name: &CellName) -> Result<(), Error> {
-        self.step(Op::Stop, name, |st| FakeDriver::set(st, name, CellState::Stopped))
+        self.step(Op::Stop, name, |st| {
+            for inner in FakeDriver::inside(st, name) {
+                if let Some(state) = st.cells.get_mut(&inner) {
+                    *state = CellState::Stopped;
+                }
+            }
+            FakeDriver::set(st, name, CellState::Stopped)
+        })
     }
 
     async fn remove(&self, name: &CellName) -> Result<(), Error> {
         self.step(Op::Remove, name, |st| {
-            st.cells.remove(name);
+            for gone in FakeDriver::inside(st, name).into_iter().chain([name.clone()]) {
+                st.cells.remove(&gone);
+                st.specs.remove(&gone);
+            }
             Ok(())
         })
     }
@@ -419,7 +462,20 @@ impl Driver for FakeDriver {
     }
 
     async fn list(&self) -> Result<Vec<Listed>, Error> {
-        Ok(self.cells().into_iter().map(|(name, state)| Listed { name, state }).collect())
+        let st = lock(&self.state);
+        self.reach(&st)?;
+        let here = |name: &CellName| st.specs.get(name).and_then(|s| s.parent.as_ref()) == self.host.as_ref();
+        Ok(st.cells.iter().filter(|(name, _)| here(name)).map(|(name, state)| Listed { name: name.clone(), state: *state }).collect())
+    }
+}
+
+impl Drivers for FakeDriver {
+    fn driver(&self, _kind: KindName, host: Host) -> Result<Arc<dyn Driver>, Error> {
+        Ok(Arc::new(FakeDriver { host: host.cell().cloned(), ..self.clone() }))
+    }
+
+    fn machine_kinds(&self) -> Vec<KindName> {
+        vec![KindName::Lima]
     }
 }
 
@@ -471,7 +527,7 @@ mod tests {
         });
         assert_eq!(fake.exec(&a, &["id".into()], ExecOpts::default()).await?.stdout_lossy(), "adytum-a id");
         assert_eq!(fake.exec(&a, &["id".into()], ExecOpts { root: true, ..ExecOpts::default() }).await?.status, Some(1));
-        let mut stream = fake.stream(&a, &["socat".into(), "-".into()]).await?;
+        let mut stream = fake.stream(&a, &["socat".into(), "-".into()], ExecOpts::default()).await?;
         let mut got = vec![0; 13];
         stream.read_exact(&mut got).await?;
         assert_eq!(got, b"hello socat -");

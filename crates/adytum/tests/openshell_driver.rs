@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use adytum::openshell::{CreateExtras, Host, ImageRef, Label, OpenShell, Profile};
 use adytum::testing::{failed, ok, FakeRunner};
-use adytum::{CellName, CellSpec, CellState, DriverKind, Resources};
+use adytum::{CellName, CellSpec, CellState, Kind, Resources};
 use adytum::{Driver, Error, ExecOpts};
 
 type Res = Result<(), Box<dyn std::error::Error>>;
@@ -22,8 +22,8 @@ fn name() -> CellName {
 fn spec() -> CellSpec {
     CellSpec {
         name: name(),
-        driver: DriverKind::OpenShell,
-        image: adytum::ImagePin::new("https://example.invalid/i.img".into(), format!("sha256:{}", "a".repeat(64)), adytum::Arch::Aarch64).expect("a pin"),
+        kind: Kind::OpenShell,
+        parent: None,
         wall: "wall_test".parse().expect("a valid wall"),
         resources: Resources::default(),
         ports: vec![],

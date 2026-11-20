@@ -16,7 +16,7 @@ use async_trait::async_trait;
 
 use crate::Error;
 
-#[cfg(any(feature = "lima", feature = "openshell"))]
+#[cfg(any(feature = "lima", feature = "openshell", feature = "container"))]
 pub(crate) fn tail(text: &str) -> String {
     const KEPT: usize = 2000;
     let text = text.trim();

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::ledger::{Ledger, OpKind, Outcome};
 use super::Cells;
 use crate::testing::{FakeDriver, Leaves, Op};
-use crate::{Arch, CellName, CellSpec, CellState, DriverKind, ImagePin, Refusal, RefusalCode, Resources};
+use crate::{Arch, CellName, CellSpec, CellState, ImagePin, Kind, LimaOptions, Refusal, RefusalCode, Resources};
 use crate::{Driver, Error};
 
 type T = Result<(), Box<dyn std::error::Error>>;
@@ -21,8 +21,8 @@ fn name(n: &str) -> Result<CellName, Box<dyn std::error::Error>> {
 fn spec(n: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
     Ok(CellSpec {
         name: name(n)?,
-        driver: DriverKind::Lima,
-        image: ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64)?,
+        kind: Kind::Lima(LimaOptions::new(ImagePin::new("https://example.test/a.img".into(), format!("sha256:{}", "0".repeat(64)), Arch::Aarch64)?)),
+        parent: None,
         wall: "wall_a".parse()?,
         resources: Resources::default(),
         ports: vec![],
@@ -272,7 +272,7 @@ fn a_ledger_with_another_version_is_refused_and_left_alone() -> T {
     }
     let before = std::fs::read(&file)?;
     match Ledger::open(&dir) {
-        Err(Error::SetUpAgain(why)) => assert!(why.contains("set Adytum up again"), "{why}"),
+        Err(Error::SetUpAgain(why)) => assert!(why.contains("left as it is"), "{why}"),
         other => panic!("{other:?}"),
     }
     assert_eq!(std::fs::read(&file)?, before);
@@ -328,4 +328,229 @@ async fn a_real_process_killed_after_intend_is_reconciled() -> T {
     cells.create(&spec("adytum-test-kill")?).await?;
     std::fs::remove_dir_all(&dir)?;
     Ok(())
+}
+
+// ---- cells in cells ----------------------------------------------------------
+
+fn host_spec(n: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
+    let mut s = spec(n)?;
+    if let Kind::Lima(options) = &mut s.kind {
+        options.containers = true;
+    }
+    Ok(s)
+}
+
+fn child_spec(n: &str, parent: &str) -> Result<CellSpec, Box<dyn std::error::Error>> {
+    let image = format!("docker.io/library/alpine@sha256:{}", "0".repeat(64)).parse()?;
+    Ok(CellSpec { kind: Kind::Container(crate::ContainerOptions { image }), parent: Some(name(parent)?), ..spec(n)? })
+}
+
+fn lines(driver: &FakeDriver) -> Vec<String> {
+    driver.calls().iter().map(ToString::to_string).collect()
+}
+
+fn state_of(cells: &Cells, n: &str) -> Option<CellState> {
+    cells.list().ok()?.into_iter().find(|c| c.spec.name.as_str() == n).map(|c| c.state)
+}
+
+/// A host with one container in it, both made through `Cells`.
+async fn nest(cells: &Cells) -> T {
+    cells.create(&host_spec("adytum-test-p")?).await?;
+    cells.create(&child_spec("adytum-test-c", "adytum-test-p")?).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn creating_a_cell_in_a_stopped_parent_starts_the_parent_first() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    assert_eq!(lines(&driver), ["create adytum-test-p", "start adytum-test-p", "create adytum-test-c"]);
+    assert_eq!((state_of(&cells, "adytum-test-p"), state_of(&cells, "adytum-test-c")), (Some(CellState::Running), Some(CellState::Stopped)));
+    assert_eq!(cells.get(&name("adytum-test-c")?)?.spec.parent, Some(name("adytum-test-p")?));
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn starting_a_cell_starts_what_it_runs_in_first() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.stop(&name("adytum-test-p")?).await?;
+    let before = driver.calls().len();
+    cells.start(&name("adytum-test-c")?).await?;
+    assert_eq!(lines(&driver)[before..], ["start adytum-test-p", "start adytum-test-c"]);
+    // A parent already running is not started again.
+    cells.stop(&name("adytum-test-c")?).await?;
+    let before = driver.calls().len();
+    cells.start(&name("adytum-test-c")?).await?;
+    assert_eq!(lines(&driver)[before..], ["start adytum-test-c"]);
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn stopping_a_parent_stops_its_running_cells_first() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.start(&name("adytum-test-c")?).await?;
+    let before = driver.calls().len();
+    cells.stop(&name("adytum-test-p")?).await?;
+    assert_eq!(lines(&driver)[before..], ["stop adytum-test-c", "stop adytum-test-p"]);
+    assert_eq!(state_of(&cells, "adytum-test-c"), Some(CellState::Stopped));
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn removing_a_running_parent_removes_its_cells_first_through_the_ledger() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    let before = driver.calls().len();
+    cells.remove(&name("adytum-test-p")?).await?;
+    assert_eq!(lines(&driver)[before..], ["remove adytum-test-c", "remove adytum-test-p"]);
+    assert!(cells.list()?.is_empty() && driver.cells().is_empty());
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn the_cells_in_a_stopped_parent_go_with_it() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.stop(&name("adytum-test-p")?).await?;
+    let before = driver.calls().len();
+    cells.remove(&name("adytum-test-p")?).await?;
+    assert_eq!(lines(&driver)[before..], ["remove adytum-test-p"], "its host is down, so the child is not asked for");
+    assert!(cells.list()?.is_empty(), "the child's row went with its parent's");
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn a_failed_remove_inside_stops_the_parents_remove() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    driver.fail_next(Op::Remove, Leaves::Nothing);
+    assert!(cells.remove(&name("adytum-test-p")?).await.is_err());
+    assert_eq!((state_of(&cells, "adytum-test-p"), state_of(&cells, "adytum-test-c")), (Some(CellState::Running), Some(CellState::Broken)));
+    cells.remove(&name("adytum-test-p")?).await?;
+    assert_eq!(cells.list()?, []);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_leaves_the_cells_of_a_stopped_parent_as_recorded() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.stop(&name("adytum-test-p")?).await?;
+    // Even a child the driver no longer has: its host cannot be asked.
+    driver.lose(&name("adytum-test-c")?);
+    let report = cells.reconcile().await?;
+    assert_eq!(report, super::Report::default());
+    assert_eq!(state_of(&cells, "adytum-test-c"), Some(CellState::Stopped));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_asks_a_running_parent_for_its_cells() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    driver.start(&name("adytum-test-c")?).await?;
+    cells.reconcile().await?;
+    assert_eq!(state_of(&cells, "adytum-test-c"), Some(CellState::Running), "the state the host gives");
+    driver.lose(&name("adytum-test-c")?);
+    let report = cells.reconcile().await?;
+    assert_eq!(report.removed, [name("adytum-test-c")?]);
+    assert_eq!(cells.list()?.len(), 1);
+    assert_agree(&cells, &driver, &[])
+}
+
+#[tokio::test]
+async fn a_parent_that_vanished_takes_its_records_along() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    driver.lose(&name("adytum-test-p")?);
+    let report = cells.reconcile().await?;
+    assert_eq!(report.removed, [name("adytum-test-p")?]);
+    assert_eq!(cells.list()?, []);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_cut_inside_a_parent_is_removed_through_the_parent() -> T {
+    let dir = scratch("nest-cut")?;
+    let driver = Arc::new(FakeDriver::new());
+    let child = child_spec("adytum-test-c", "adytum-test-p")?;
+    {
+        let cells = Cells::open(&dir, driver.clone())?;
+        cells.create(&host_spec("adytum-test-p")?).await?;
+        cells.start(&name("adytum-test-p")?).await?;
+        cells.ledger.intend_create(&child)?;
+        driver.fail_next(Op::Create, Leaves::Cell(CellState::Broken));
+        let inside = cells.driver_of(&child.name)?;
+        assert!(inside.create(&child).await.is_err());
+    }
+    let cells = restart(&dir, &driver)?;
+    let report = cells.reconcile().await?;
+    assert_eq!(report.removed, std::slice::from_ref(&child.name));
+    assert!(lines(&driver).last().is_some_and(|l| l == "remove adytum-test-c"), "{:?}", lines(&driver));
+    assert_eq!(cells.list()?.len(), 1);
+    assert_agree(&cells, &driver, &[])?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_operation_left_open_on_a_cell_that_went_with_its_parent_is_settled() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    cells.ledger.intend(OpKind::Start, &name("adytum-test-c")?)?;
+    cells.stop(&name("adytum-test-c")?).await.ok();
+    // The parent is removed while the child's start is still open.
+    cells.stop(&name("adytum-test-p")?).await?;
+    cells.remove(&name("adytum-test-p")?).await?;
+    assert_eq!(cells.ledger.open_ops()?.len(), 1);
+    cells.reconcile().await?;
+    assert_eq!(cells.ledger.open_ops()?, []);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_foreign_cell_inside_a_parent_is_not_replaced() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    cells.create(&host_spec("adytum-test-p")?).await?;
+    cells.start(&name("adytum-test-p")?).await?;
+    // Made in the parent by someone else, so its listing shows it.
+    driver.create(&child_spec("adytum-test-c", "adytum-test-p")?).await?;
+    match cells.create(&child_spec("adytum-test-c", "adytum-test-p")?).await {
+        Err(Error::Refused(r)) => assert_eq!(r.code, RefusalCode::NameTaken),
+        other => panic!("{other:?}"),
+    }
+    let report = cells.reconcile().await?;
+    assert!(report.unrecorded.is_empty(), "a parent with no recorded cells in it is not listed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_driver_inside_a_stopped_parent_cannot_be_reached() -> T {
+    let driver = Arc::new(FakeDriver::new());
+    let cells = Cells::memory(driver.clone())?;
+    nest(&cells).await?;
+    driver.stop(&name("adytum-test-p")?).await?;
+    let inside = cells.driver_of(&name("adytum-test-c")?)?;
+    assert!(matches!(inside.exec(&name("adytum-test-c")?, &["true".into()], crate::ExecOpts::default()).await, Err(Error::Tool { .. })));
+    assert!(matches!(cells.driver_of(&name("adytum-test-x")?), Err(Error::NotRecorded(_))));
+    Ok(())
+}
+
+#[test]
+fn a_ledger_this_adytum_cannot_read_says_how_to_start_over() {
+    let fix = Error::SetUpAgain("x".to_owned()).fix().to_owned();
+    assert!(fix.contains("limactl delete") && fix.contains("move adytum.sqlite"), "{fix}");
 }

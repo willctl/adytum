@@ -29,7 +29,7 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         let driver = Arc::new(FakeDriver::new());
         driver.on_exec(|call| if call.argv[0] == "fail" { failed(3, "bad\n") } else { ok(&call.argv.join(" ")) });
-        Rig { ctx: Context { driver: driver.clone(), home }, driver }
+        Rig { ctx: Context { drivers: driver.clone(), home }, driver }
     }
 
     async fn go(&self, line: &str) -> Run {
@@ -287,4 +287,69 @@ async fn start_and_stop_are_recorded_and_settled() {
     assert_eq!(rig.go("ls --json").await.json()["cells"][0]["state"], "running");
     assert_eq!(rig.go("stop adytum-test-a").await.code, 0);
     assert_eq!(rig.go("ls --json").await.json()["cells"][0]["state"], "stopped");
+}
+
+const IMAGE: &str = "docker.io/library/alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f";
+
+#[tokio::test]
+async fn a_container_in_a_cell_keeps_its_wall_and_seal_and_shows_under_it() {
+    let rig = Rig::new("nest");
+    assert_eq!(rig.go("create adytum-test-p --sealed --wall wall_x --containers").await.code, 0);
+    let r = rig.go(&format!("create adytum-test-c --kind container --parent adytum-test-p --image {IMAGE} --json")).await;
+    assert_eq!(r.code, 0, "{}", r.out);
+    let v = r.json();
+    assert_eq!((v["kind"].as_str(), v["parent"].as_str(), v["wall"].as_str(), v["sealed"].as_bool()), (Some("container"), Some("adytum-test-p"), Some("wall_x"), Some(true)));
+    assert_eq!(rig.calls(), ["create adytum-test-p", "start adytum-test-p", "create adytum-test-c"]);
+    let rows = rig.go("ls --json").await.json()["cells"].clone();
+    // In name order, each naming its parent.
+    assert_eq!((rows[0]["name"].as_str(), rows[0]["parent"].as_str(), rows[0]["kind"].as_str()), (Some("adytum-test-c"), Some("adytum-test-p"), Some("container")));
+    assert_eq!((rows[1]["name"].as_str(), &rows[1]["parent"]), (Some("adytum-test-p"), &Value::Null));
+    assert_eq!(rig.go("ls").await.out, "adytum-test-p  running  wall_x  lima\n  adytum-test-c  stopped  wall_x  container\n");
+    let r = rig.go("exec adytum-test-c --json -- id -u").await;
+    assert_eq!(r.json()["stdout"], "id -u");
+    assert!(rig.calls().last().is_some_and(|c| c == "exec adytum-test-c id -u"));
+    assert_eq!(rig.go("rm adytum-test-p --json").await.json()["removed"], true);
+    assert_eq!(rig.calls()[rig.calls().len() - 2..], ["remove adytum-test-c", "remove adytum-test-p"]);
+    assert_eq!(rig.go("ls").await.out, "no cells\n");
+}
+
+#[tokio::test]
+async fn the_nesting_rules_answer_through_the_command() {
+    let rig = Rig::new("nestrules");
+    assert_eq!(rig.go("create adytum-test-v").await.code, 0);
+    let child = format!("create adytum-test-c --kind container --image {IMAGE} --json --parent");
+    for (parent, extra, code) in [("adytum-test-v", "", "parent_cannot_host"), ("adytum-test-nope", "", "not_recorded"), ("adytum-test-v", " --wall wall_other", "parent_wall")] {
+        let r = rig.go(&format!("{child} {parent}{extra}")).await;
+        assert_eq!((r.code, r.json()["error"]["code"].as_str()), (1, Some(code)), "{parent}{extra}: {}", r.out);
+    }
+    assert_eq!(rig.go("create adytum-test-h --containers").await.code, 0);
+    let r = rig.go(&format!("{child} adytum-test-h --port 18080:80")).await;
+    assert_eq!(r.json()["error"]["code"], "nested_port");
+    assert!(rig.calls().iter().all(|c| !c.contains("adytum-test-c")), "{:?}", rig.calls());
+}
+
+#[tokio::test]
+async fn a_wrong_kind_or_image_is_a_usage_error_before_the_ledger_opens() {
+    let rig = Rig::new("kinds");
+    for line in [
+        "create adytum-test-c --kind container".to_owned(),
+        "create adytum-test-c --kind container --image alpine:3.22".to_owned(),
+        format!("create adytum-test-c --kind container --image {IMAGE} --containers"),
+        format!("create adytum-test-c --kind container --image {IMAGE} --nested-virtualization"),
+        "create adytum-test-c --kind vm".to_owned(),
+        "create adytum-test-c --image nonesuch".to_owned(),
+    ] {
+        let r = rig.go(&format!("{line} --json")).await;
+        assert_eq!((r.code, r.json()["error"]["code"].as_str()), (2, Some("usage")), "{line}: {}", r.out);
+    }
+    assert!(!rig.ctx.home.exists(), "a refused line made Adytum's folder");
+}
+
+#[tokio::test]
+async fn a_lima_cell_can_ask_for_containers_and_nested_virtualization() {
+    let rig = Rig::new("limaopts");
+    assert_eq!(rig.go("create adytum-test-v --containers --nested-virtualization").await.code, 0);
+    let spec = rig.driver.spec(&"adytum-test-v".parse().unwrap()).unwrap();
+    let adytum::Kind::Lima(options) = spec.kind else { panic!("{spec:?}") };
+    assert!(options.containers && options.nested_virtualization);
 }

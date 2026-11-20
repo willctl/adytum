@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use adytum::{CellName, CellSpec, CellState, DriverKind, GuestUser, Port, Resources, Wall};
+use adytum::{Cell, CellName, CellSpec, CellState, ContainerOptions, GuestUser, Kind, LimaOptions, OciImage, Port, Resources, Wall};
 use adytum::{Cells, ExecOpts, Report};
 use serde_json::{json, Value};
 
@@ -17,7 +17,7 @@ struct Session {
 
 impl Session {
     async fn open(ctx: &Context, err: &mut dyn Write) -> Result<Session, Failure> {
-        let cells = Cells::open(&ctx.home, ctx.driver.clone())?;
+        let cells = Cells::open(&ctx.home, ctx.drivers.clone())?;
         let report = cells.reconcile().await?;
         for (what, names) in [("removed the half-made or vanished cell", &report.removed), ("finished removing", &report.finished)] {
             for name in names {
@@ -50,10 +50,7 @@ pub(crate) async fn execute(command: Command, ctx: &Context, out: &mut dyn Write
         Command::Help => Ok(Done::new(json!({}), String::new())),
         Command::Version => Ok(Done::new(json!({ "version": env!("CARGO_PKG_VERSION") }), format!("adytum {}", env!("CARGO_PKG_VERSION")))),
         Command::Doctor => doctor().await,
-        Command::Create(args) => {
-            let spec = spec_from(&args, args.name.parse::<CellName>()?)?;
-            create(ctx, err, spec).await
-        }
+        Command::Create(args) => create(ctx, err, &args).await,
         Command::Start(name) => {
             let name = name.parse::<CellName>()?;
             let session = Session::open(ctx, err).await?;
@@ -93,11 +90,35 @@ fn usage(message: impl Into<String>, fix: impl Into<String>) -> Failure {
     Failure::from(Usage { message: message.into(), fix: fix.into() })
 }
 
-fn spec_from(args: &CreateArgs, name: CellName) -> Result<CellSpec, Failure> {
-    let image_name = args.image.as_deref().unwrap_or(adytum::lima::DEFAULT_IMAGE);
-    let image = adytum::lima::image(image_name)
-        .ok_or_else(|| usage(format!("There is no image named {image_name:?}."), format!("Use one of: {}.", adytum::lima::image_names().join(", "))))?;
-    let wall: Wall = args.wall.as_deref().unwrap_or(DEFAULT_WALL).parse().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))?;
+fn spec_from(args: &CreateArgs, name: CellName, parent: Option<&Cell>) -> Result<CellSpec, Failure> {
+    let lima_only = |flag: &str| usage(format!("--{flag} is for a Lima cell."), format!("Leave --{flag} out, or make a Lima cell."));
+    let kind = match args.kind.as_deref().unwrap_or("lima") {
+        "lima" => {
+            let image_name = args.image.as_deref().unwrap_or(adytum::lima::DEFAULT_IMAGE);
+            let image = adytum::lima::image(image_name)
+                .ok_or_else(|| usage(format!("There is no image named {image_name:?}."), format!("Use one of: {}.", adytum::lima::image_names().join(", "))))?;
+            Kind::Lima(LimaOptions { image, containers: args.containers, nested_virtualization: args.nested_virtualization })
+        }
+        "container" => {
+            if args.containers {
+                return Err(lima_only("containers"));
+            }
+            if args.nested_virtualization {
+                return Err(lima_only("nested-virtualization"));
+            }
+            let text = args.image.as_deref().ok_or_else(|| usage("A container cell needs an image.", "Give --image <reference>@sha256:<digest>."))?;
+            let image: OciImage =
+                text.parse().map_err(|e| usage(format!("{e}."), "Give --image <reference>@sha256:<digest>, such as docker.io/library/alpine:3.22@sha256:<64 hex>."))?;
+            Kind::Container(ContainerOptions { image })
+        }
+        other => return Err(usage(format!("There is no kind of cell named {other:?}."), "Use --kind lima or --kind container.")),
+    };
+    // A cell in a cell keeps its parent's wall, and is sealed if the parent is.
+    let wall = match (&args.wall, parent) {
+        (Some(wall), _) => wall.parse::<Wall>().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))?,
+        (None, Some(parent)) => parent.spec.wall.clone(),
+        (None, None) => DEFAULT_WALL.parse::<Wall>().map_err(|e| usage(format!("{e}."), "Write a wall like wall_work."))?,
+    };
     let defaults = Resources::default();
     let resources = Resources { cpus: args.cpus.unwrap_or(defaults.cpus), memory_mib: args.memory_mib.unwrap_or(defaults.memory_mib), disk_gib: defaults.disk_gib };
     if resources.cpus == 0 || resources.memory_mib == 0 {
@@ -105,13 +126,13 @@ fn spec_from(args: &CreateArgs, name: CellName) -> Result<CellSpec, Failure> {
     }
     Ok(CellSpec {
         name,
-        driver: DriverKind::Lima,
-        image,
+        kind,
+        parent: parent.map(|p| p.spec.name.clone()),
         wall,
         resources,
         ports: loopback_ports(&args.ports),
         mounts: Vec::new(),
-        sealed: args.sealed,
+        sealed: args.sealed || parent.is_some_and(|p| p.spec.sealed),
         network: None,
         clone_from: None,
     })
@@ -122,13 +143,29 @@ fn loopback_ports(ports: &[(u16, u16)]) -> Vec<Port> {
     ports.iter().map(|&(host, guest)| Port { guest, host, bind: loopback }).collect()
 }
 
-async fn create(ctx: &Context, err: &mut dyn Write, spec: CellSpec) -> Result<Done, Failure> {
+fn kind_text(kind: &Kind) -> Value {
+    serde_json::to_value(kind.name()).unwrap_or(Value::Null)
+}
+
+async fn create(ctx: &Context, err: &mut dyn Write, args: &CreateArgs) -> Result<Done, Failure> {
+    let name = args.name.parse::<CellName>()?;
+    let parent = args.parent.as_deref().map(str::parse::<CellName>).transpose()?;
+    // Checked before the ledger is opened, so a wrong line leaves no trace.
+    if parent.is_none() {
+        spec_from(args, name.clone(), None)?;
+    }
     let session = Session::open(ctx, err).await?;
+    let parent = match &parent {
+        Some(p) => Some(session.cells.get(p)?),
+        None => None,
+    };
+    let spec = spec_from(args, name, parent.as_ref())?;
     let id = session.cells.create(&spec).await?;
     let sealed = if spec.sealed { ", sealed" } else { "" };
+    let inside = spec.parent.as_ref().map(|p| format!(" in {p}")).unwrap_or_default();
     Ok(session.done(
-        json!({ "name": spec.name, "id": id.to_string(), "state": CellState::Stopped, "wall": spec.wall, "sealed": spec.sealed }),
-        format!("created {} ({}{sealed}); start it with `adytum start {}`", spec.name, spec.wall, spec.name),
+        json!({ "name": spec.name, "id": id.to_string(), "state": CellState::Stopped, "wall": spec.wall, "sealed": spec.sealed, "kind": kind_text(&spec.kind), "parent": spec.parent }),
+        format!("created {}{inside} ({}{sealed}); start it with `adytum start {}`", spec.name, spec.wall, spec.name),
     ))
 }
 
@@ -148,8 +185,7 @@ async fn clone(ctx: &Context, err: &mut dyn Write, from: &CellName, to: CellName
 async fn exec(ctx: &Context, name: &str, argv: &[String], out: &mut dyn Write, err: &mut dyn Write, json: bool) -> Result<Done, Failure> {
     let name = name.parse::<CellName>()?;
     let session = Session::open(ctx, err).await?;
-    session.recorded(&name)?;
-    let output = session.cells.driver().exec(&name, argv, ExecOpts::default()).await?;
+    let output = session.cells.driver_of(&name)?.exec(&name, argv, ExecOpts::default()).await?;
     let exit = i32::from(!output.success());
     if json {
         let status = output.status;
@@ -193,30 +229,39 @@ async fn copy(ctx: &Context, err: &mut dyn Write, src: &str, dst: &str, owner: O
     }
     let owner = owner.map(str::parse::<GuestUser>).transpose()?;
     let session = Session::open(ctx, err).await?;
-    session.recorded(&name)?;
+    let driver = session.cells.driver_of(&name)?;
     if to_cell {
         let path = guest_side(dst).map_or("", |(_, p)| p);
-        session.cells.driver().copy_in(&name, &absolute(src)?, path, owner.as_ref()).await?;
+        driver.copy_in(&name, &absolute(src)?, path, owner.as_ref()).await?;
     } else {
         let path = guest_side(src).map_or("", |(_, p)| p);
-        session.cells.driver().copy_out(&name, path, &absolute(dst)?).await?;
+        driver.copy_out(&name, path, &absolute(dst)?).await?;
     }
     Ok(session.done(json!({ "from": src, "to": dst }), format!("copied {src} to {dst}")))
 }
 
 async fn list(ctx: &Context, err: &mut dyn Write) -> Result<Done, Failure> {
     let session = Session::open(ctx, err).await?;
-    let mut rows = Vec::new();
+    let cells = session.cells.list()?;
+    let rows: Vec<Value> =
+        cells.iter().map(|c| json!({ "name": c.spec.name, "state": c.state, "wall": c.spec.wall, "kind": kind_text(&c.spec.kind), "parent": c.spec.parent })).collect();
     let mut lines = Vec::new();
-    for cell in session.cells.list()? {
-        let name = &cell.spec.name;
-        rows.push(json!({ "name": name, "state": cell.state, "wall": cell.spec.wall }));
-        let state = serde_json::to_value(cell.state).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
-        lines.push(format!("{name}  {state}  {}", cell.spec.wall));
-    }
+    tree(&cells, None, 0, &mut lines);
     for name in &session.report.unrecorded {
         lines.push(format!("{name}  (not recorded by adytum; left alone)"));
     }
     let text = if lines.is_empty() { "no cells".to_owned() } else { lines.join("\n") };
     Ok(session.done(json!({ "cells": rows }), text))
+}
+
+/// Each cell, then the cells inside it two spaces further in.
+fn tree(cells: &[Cell], parent: Option<&CellName>, depth: usize, lines: &mut Vec<String>) {
+    for cell in cells.iter().filter(|c| c.spec.parent.as_ref() == parent) {
+        let text = |v: Value| v.as_str().map(str::to_owned).unwrap_or_default();
+        let (state, kind) = (text(serde_json::to_value(cell.state).unwrap_or(Value::Null)), text(kind_text(&cell.spec.kind)));
+        lines.push(format!("{}{}  {state}  {}  {kind}", "  ".repeat(depth), cell.spec.name, cell.spec.wall));
+        if depth < 8 {
+            tree(cells, Some(&cell.spec.name), depth + 1, lines);
+        }
+    }
 }

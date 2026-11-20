@@ -21,7 +21,12 @@ impl fmt::Display for Usage {
 #[derive(Debug, PartialEq, Eq, Default)]
 pub struct CreateArgs {
     pub name: String,
+    /// `lima` unless given.
+    pub kind: Option<String>,
+    pub parent: Option<String>,
     pub sealed: bool,
+    pub containers: bool,
+    pub nested_virtualization: bool,
     pub wall: Option<String>,
     pub cpus: Option<u8>,
     pub memory_mib: Option<u32>,
@@ -57,6 +62,15 @@ adytum: cells on this machine
 Usage:
   adytum create <name> [--sealed] [--wall wall_x] [--cpus N] [--memory MiB]
                        [--image ubuntu-24.04] [--port host:guest]...
+                       [--containers] [--nested-virtualization]
+                                         (a Lima VM; --containers lets it hold
+                                          container cells)
+  adytum create <name> --kind container --image <ref>@sha256:<digest>
+                       [--parent <cell>] [--sealed] [--cpus N] [--memory MiB]
+                                         (a container, in <cell> or through
+                                          docker here; in a cell it keeps the
+                                          cell's wall, and is sealed if the
+                                          cell is)
   adytum start <name>
   adytum stop <name>
   adytum rm <name>
@@ -68,7 +82,7 @@ Usage:
                                          (one side is <name>:<absolute path>;
                                           --owner writes a copy into a cell
                                           as that guest user, such as root)
-  adytum ls
+  adytum ls                              (cells inside a cell are indented under it)
   adytum doctor                          (what is wrong with the setup; exit 1 on a failure)
   adytum --version
 
@@ -78,13 +92,14 @@ Exit codes: 0 done, 1 refused or failed, 2 usage error.
 Cells are named adytum-<lowercase letters, digits, dashes>.
 ";
 
-const VALUE_FLAGS: [&str; 6] = ["wall", "cpus", "memory", "image", "port", "owner"];
+const VALUE_FLAGS: [&str; 8] = ["wall", "cpus", "memory", "image", "port", "owner", "kind", "parent"];
+const SWITCHES: [&str; 3] = ["sealed", "containers", "nested-virtualization"];
 
 #[derive(Default)]
 struct Raw {
     json: bool,
     help: bool,
-    sealed: bool,
+    switches: Vec<String>,
     positional: Vec<String>,
     values: Vec<(String, String)>,
     rest: Option<Vec<String>>,
@@ -108,7 +123,7 @@ fn tokenize(tokens: &[String]) -> Result<Raw, Usage> {
             match name {
                 "json" => raw.json = true,
                 "help" => raw.help = true,
-                "sealed" => raw.sealed = true,
+                n if SWITCHES.contains(&n) => raw.switches.push(n.to_owned()),
                 n if VALUE_FLAGS.contains(&n) => {
                     let value = match inline {
                         Some(v) => v,
@@ -150,7 +165,7 @@ fn one_name(command: &str, raw: &Raw) -> Result<String, Usage> {
 }
 
 fn only_json(command: &str, raw: &Raw) -> Result<(), Usage> {
-    if raw.sealed || !raw.values.is_empty() || raw.rest.is_some() {
+    if !raw.switches.is_empty() || !raw.values.is_empty() || raw.rest.is_some() {
         return Err(Usage::new(format!("`adytum {command}` does not take that option."), "Run `adytum --help` to see which commands take which."));
     }
     Ok(())
@@ -176,9 +191,18 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
             if raw.rest.is_some() {
                 return Err(Usage::new("`adytum create` takes no command after --.", "Use `adytum exec` to run something."));
             }
-            let mut args = CreateArgs { name: one_name("create", &raw)?, sealed: raw.sealed, ..CreateArgs::default() };
+            let has = |s: &str| raw.switches.iter().any(|w| w == s);
+            let mut args = CreateArgs {
+                name: one_name("create", &raw)?,
+                sealed: has("sealed"),
+                containers: has("containers"),
+                nested_virtualization: has("nested-virtualization"),
+                ..CreateArgs::default()
+            };
             for (flag, value) in &raw.values {
                 match flag.as_str() {
+                    "kind" => args.kind = Some(value.clone()),
+                    "parent" => args.parent = Some(value.clone()),
                     "wall" => args.wall = Some(value.clone()),
                     "image" => args.image = Some(value.clone()),
                     "cpus" => args.cpus = Some(number(flag, value)?),
@@ -199,7 +223,7 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
             }
         }
         "clone" => {
-            if raw.sealed || raw.rest.is_some() || raw.values.iter().any(|(f, _)| f != "wall" && f != "port") {
+            if !raw.switches.is_empty() || raw.rest.is_some() || raw.values.iter().any(|(f, _)| f != "wall" && f != "port") {
                 return Err(Usage::new("`adytum clone` takes only --wall and --port.", "Write adytum clone <from> <to> [--wall wall_x] [--port host:guest]."));
             }
             let [from, to] = raw.positional.as_slice() else {
@@ -224,7 +248,7 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
             Command::Doctor
         }
         "exec" => {
-            if raw.sealed || !raw.values.is_empty() {
+            if !raw.switches.is_empty() || !raw.values.is_empty() {
                 return Err(Usage::new("`adytum exec` does not take that option.", "Write adytum exec <name> -- <command> [args...]."));
             }
             let name = one_name("exec", &raw)?;
@@ -234,7 +258,7 @@ pub fn parse(tokens: &[String]) -> Result<Parsed, Usage> {
             }
         }
         "cp" => {
-            let owner = match (raw.sealed || raw.rest.is_some(), raw.values.as_slice()) {
+            let owner = match (!raw.switches.is_empty() || raw.rest.is_some(), raw.values.as_slice()) {
                 (false, []) => None,
                 (false, [(flag, user)]) if flag == "owner" => Some(user.clone()),
                 _ => return Err(Usage::new("`adytum cp` takes only --owner, once.", "Write adytum cp [--owner user] <source> <destination>.")),
@@ -267,8 +291,7 @@ mod tests {
 
     #[test]
     fn create_reads_every_option() {
-        let parsed =
-            p("create adytum-a --sealed --wall wall_x --cpus 4 --memory=4096 --image ubuntu-24.04 --port 18080:80 --port 18443:443 --json").unwrap();
+        let parsed = p("create adytum-a --sealed --wall wall_x --cpus 4 --memory=4096 --image ubuntu-24.04 --port 18080:80 --port 18443:443 --json").unwrap();
         assert!(parsed.json);
         let Command::Create(a) = parsed.command else { panic!("not create") };
         assert_eq!(a.name, "adytum-a");
@@ -276,6 +299,11 @@ mod tests {
         assert_eq!(a.wall.as_deref(), Some("wall_x"));
         assert_eq!((a.cpus, a.memory_mib), (Some(4), Some(4096)));
         assert_eq!(a.ports, [(18080, 80), (18443, 443)]);
+        assert!(!a.containers && !a.nested_virtualization && a.kind.is_none() && a.parent.is_none());
+        let Command::Create(a) = p("create adytum-v --containers --nested-virtualization").unwrap().command else { panic!("not create") };
+        assert!(a.containers && a.nested_virtualization);
+        let Command::Create(a) = p("create adytum-c --kind container --parent adytum-v --image alpine@sha256:00").unwrap().command else { panic!("not create") };
+        assert_eq!((a.kind.as_deref(), a.parent.as_deref(), a.image.as_deref()), (Some("container"), Some("adytum-v"), Some("alpine@sha256:00")));
     }
 
     #[test]
@@ -307,6 +335,8 @@ mod tests {
             "create adytum-a --bogus",
             "create adytum-a --owner root",
             "start adytum-a --sealed",
+            "start adytum-a --containers",
+            "ls --parent adytum-a",
             "ls --wall wall_x",
             "clone adytum-a",
             "clone adytum-a adytum-b --sealed",

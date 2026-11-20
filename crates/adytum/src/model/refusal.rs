@@ -14,6 +14,14 @@ pub enum RefusalCode {
     WallClone,
     /// An OpenShell policy file changed after it was previewed.
     PolicyChanged,
+    ParentMissing,
+    ParentWall,
+    ParentCannotHost,
+    ParentSealed,
+    NestedPort,
+    NestedMount,
+    TooDeep,
+    CloneHost,
 }
 
 impl RefusalCode {
@@ -27,6 +35,14 @@ impl RefusalCode {
             Self::WallMount => "wall_mount",
             Self::WallClone => "wall_clone",
             Self::PolicyChanged => "policy_changed",
+            Self::ParentMissing => "parent_missing",
+            Self::ParentWall => "parent_wall",
+            Self::ParentCannotHost => "parent_cannot_host",
+            Self::ParentSealed => "parent_sealed",
+            Self::NestedPort => "nested_port",
+            Self::NestedMount => "nested_mount",
+            Self::TooDeep => "too_deep",
+            Self::CloneHost => "clone_host",
         }
     }
 }
@@ -69,6 +85,14 @@ mod tests {
             (RefusalCode::WallMount, "wall_mount"),
             (RefusalCode::WallClone, "wall_clone"),
             (RefusalCode::PolicyChanged, "policy_changed"),
+            (RefusalCode::ParentMissing, "parent_missing"),
+            (RefusalCode::ParentWall, "parent_wall"),
+            (RefusalCode::ParentCannotHost, "parent_cannot_host"),
+            (RefusalCode::ParentSealed, "parent_sealed"),
+            (RefusalCode::NestedPort, "nested_port"),
+            (RefusalCode::NestedMount, "nested_mount"),
+            (RefusalCode::TooDeep, "too_deep"),
+            (RefusalCode::CloneHost, "clone_host"),
         ];
         for (code, text) in pairs {
             assert_eq!(code.as_str(), text);

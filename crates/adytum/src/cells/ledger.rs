@@ -1,5 +1,6 @@
 //! A file with another schema hash in `user_version` is refused and left
-//! alone; nothing is migrated.
+//! alone; nothing is migrated. A cell's row names the cell it runs in, and
+//! goes when that row goes.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -93,11 +94,7 @@ fn is_empty(c: &Connection) -> Result<bool, Error> {
 }
 
 fn other_version(file: &Path, v: i32) -> Error {
-    Error::SetUpAgain(format!(
-        "{} was made by another Adytum (version {v}, this one's is {}): it is left as it is; set Adytum up again on this machine.",
-        file.display(),
-        schema::version()
-    ))
+    Error::SetUpAgain(format!("{} was made by another Adytum (version {v}, this one's is {}), and is left as it is.", file.display(), schema::version()))
 }
 
 impl Ledger {
@@ -133,7 +130,7 @@ impl Ledger {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if version_of(&tx)? == 0 {
             if !is_empty(&tx)? {
-                return Err(Error::SetUpAgain("the file holds a database that is not Adytum's ledger: it is left as it is; set Adytum up again on this machine.".to_owned()));
+                return Err(Error::SetUpAgain("The file holds a database that is not Adytum's ledger, and is left as it is.".to_owned()));
             }
             for t in schema::TABLES {
                 tx.execute_batch(t)?;
@@ -161,7 +158,7 @@ impl Ledger {
     pub(crate) fn intend_create(&self, spec: &CellSpec) -> Result<OpId, Error> {
         let id = CellId::new_random()?;
         let spec_json = serde_json::to_string(spec).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let driver = enum_text(&spec.driver)?;
+        let kind = enum_text(&spec.kind.name())?;
         let state = enum_text(&CellState::Creating)?;
         let at = now();
         self.write(|tx| {
@@ -172,8 +169,8 @@ impl Ledger {
                 );
             }
             tx.execute(
-                "INSERT INTO cells (name, id, driver, wall, spec_json, state, created_at, settled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-                params![spec.name.as_str(), id.to_string(), driver, spec.wall.as_str(), spec_json, state, at],
+                "INSERT INTO cells (name, id, kind, parent, wall, spec_json, state, created_at, settled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![spec.name.as_str(), id.to_string(), kind, spec.parent.as_ref().map(CellName::as_str), spec.wall.as_str(), spec_json, state, at],
             )?;
             tx.execute("INSERT INTO ops (name, kind, started_at) VALUES (?1, 'create', ?2)", params![spec.name.as_str(), at])?;
             Ok(OpId(tx.last_insert_rowid()))
