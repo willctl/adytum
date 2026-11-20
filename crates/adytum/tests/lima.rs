@@ -1,6 +1,8 @@
 //! The Lima driver against a fake runner: what limactl is asked, what is
 //! refused before it runs, and what its failures become.
 
+// Lima cells need a Mac or Linux host.
+#![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "the helpers here fail where they stand, as a test does")]
 
 use std::path::{Path, PathBuf};

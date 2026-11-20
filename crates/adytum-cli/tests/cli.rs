@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static RUNS: AtomicUsize = AtomicUsize::new(0);
 
 fn adytum(args: &[&str]) -> (i32, String, String, PathBuf) {
-    let home = PathBuf::from("/tmp").join(format!("adl-cli-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed)));
+    // Short, for Lima's sockets, where Lima runs.
+    let tmp = if cfg!(unix) { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    let home = tmp.join(format!("adl-cli-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed)));
     let empty_path = home.join("no-programs-here");
     let out = Command::new(env!("CARGO_BIN_EXE_adytum"))
         .args(args)

@@ -185,7 +185,9 @@ pub(crate) fn network_for(spec: &CellSpec) -> Option<String> {
     spec.network.as_ref().map(|n| lima_network_name(&spec.wall, n))
 }
 
+// Lima cells need a Mac or Linux host.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::{ImagePin, Mount, Port, Resources, Wall};

@@ -48,11 +48,28 @@ fn with_foreign() -> Result<FakeDriver, Box<dyn std::error::Error>> {
     Ok(driver)
 }
 
-fn scratch(tag: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// A scratch folder, removed when the test ends. Declared before the
+/// handles that use it, it outlives them, as Windows needs to delete it.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Result<Scratch, Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join(format!("adytum-ledger-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    Ok(Scratch(dir))
 }
 
 /// The ledger and the driver hold the same cells in the same states and
@@ -99,7 +116,6 @@ async fn kill_create(cut: Cut, tag: &str) -> T {
     cells.create(&want).await?;
     assert_agree(&cells, &driver, &[FOREIGN])?;
     assert_eq!(cells.list()?.first().map(|c| c.state), Some(CellState::Stopped));
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -139,7 +155,6 @@ async fn kill_remove(cut: Cut, tag: &str) -> T {
     assert_agree(&cells, &driver, &[FOREIGN])?;
     cells.create(&cell).await?;
     assert_agree(&cells, &driver, &[FOREIGN])?;
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -277,7 +292,6 @@ fn a_ledger_with_another_version_is_refused_and_left_alone() -> T {
         other => panic!("{other:?}"),
     }
     assert_eq!(std::fs::read(&file)?, before);
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -298,7 +312,6 @@ fn two_handles_on_one_file_share_one_order_of_writes() -> T {
     assert_eq!(b.open_ops()?.len(), 20);
     // The same name through the other handle is refused, not doubled.
     assert!(matches!(b.intend_create(&specs[0], None), Err(Error::Refused(Refusal { code: RefusalCode::NameTaken, .. }))));
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -316,7 +329,7 @@ fn helper() -> T {
 #[tokio::test]
 async fn a_real_process_killed_after_intend_is_reconciled() -> T {
     let dir = scratch("proc")?;
-    let status = std::process::Command::new(std::env::current_exe()?).args(["--exact", "cells::tests::helper", "--nocapture"]).env(HELPER_ENV, &dir).status()?;
+    let status = std::process::Command::new(std::env::current_exe()?).args(["--exact", "cells::tests::helper", "--nocapture"]).env(HELPER_ENV, &*dir).status()?;
     assert!(!status.success(), "the helper should have aborted");
     // The cell the dead process may have made: the driver has it half-made.
     let driver = Arc::new(with_foreign()?);
@@ -327,7 +340,6 @@ async fn a_real_process_killed_after_intend_is_reconciled() -> T {
     assert_eq!(report.removed, vec![name("adytum-test-kill")?]);
     assert_agree(&cells, &driver, &[FOREIGN])?;
     cells.create(&spec("adytum-test-kill")?).await?;
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -502,7 +514,6 @@ async fn a_create_cut_inside_a_parent_is_removed_through_the_parent() -> T {
     assert!(lines(&driver).last().is_some_and(|l| l == "remove adytum-test-c"), "{:?}", lines(&driver));
     assert_eq!(cells.list()?.len(), 1);
     assert_agree(&cells, &driver, &[])?;
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 

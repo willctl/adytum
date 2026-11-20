@@ -5,7 +5,7 @@
 
 #![expect(clippy::unwrap_used, reason = "the helpers here fail where they stand, as a test does")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -41,11 +41,28 @@ fn lima(name: &str, wall: &str) -> CellSpec {
     CellSpec { kind: Kind::Lima(LimaOptions { containers: true, ..LimaOptions::new(pin) }), parent: None, resources: Resources::default(), ..container(name, None, wall) }
 }
 
-fn scratch(tag: &str) -> PathBuf {
+/// A scratch folder, removed when the test ends. Declared before the
+/// handles that use it, it outlives them, as Windows needs to delete it.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Scratch {
     let d = std::env::temp_dir().join(format!("adytum-boundaries-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Scratch(d)
 }
 
 #[tokio::test]
@@ -55,6 +72,8 @@ async fn a_containers_own_stderr_is_its_output_not_the_cell_gone() {
     assert_eq!(out.status, Some(1));
 }
 
+// Lima cells need a Mac or Linux host.
+#[cfg(unix)]
 #[tokio::test]
 async fn stderr_through_a_lima_parent_is_never_the_parent_or_the_child_gone() {
     let runner = Arc::new(FakeRunner::new(|_| failed(1, "time=x level=fatal msg=\"snapshot abc does not exist\"\n")));
@@ -92,7 +111,6 @@ async fn a_name_taken_during_the_pull_is_refused_and_the_other_container_is_left
     let argv = runner.argv();
     assert!(argv.iter().all(|a| a[1] != "rm"), "{argv:?}");
     assert_eq!(cells.list().unwrap(), [], "nothing recorded");
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 /// Swaps the parent for one behind another wall while it starts.
@@ -140,10 +158,10 @@ impl Driver for RacingDriver {
     async fn stream(&self, a: &CellName, b: &[String], c: ExecOpts) -> Result<exec::Duplex, Error> {
         self.inner.stream(a, b, c).await
     }
-    async fn copy_in(&self, a: &CellName, b: &std::path::Path, c: &str, d: Option<&GuestUser>) -> Result<(), Error> {
+    async fn copy_in(&self, a: &CellName, b: &Path, c: &str, d: Option<&GuestUser>) -> Result<(), Error> {
         self.inner.copy_in(a, b, c, d).await
     }
-    async fn copy_out(&self, a: &CellName, b: &str, c: &std::path::Path) -> Result<(), Error> {
+    async fn copy_out(&self, a: &CellName, b: &str, c: &Path) -> Result<(), Error> {
         self.inner.copy_out(a, b, c).await
     }
     async fn stop(&self, a: &CellName) -> Result<(), Error> {
@@ -161,12 +179,11 @@ impl Driver for RacingDriver {
 async fn a_parent_swapped_while_it_starts_does_not_adopt_the_child() {
     let home = scratch("race");
     let fake = FakeDriver::new();
-    let cells = Cells::open(&home, Arc::new(Racing { fake: fake.clone(), home: home.clone(), fired: Arc::new(AtomicBool::new(false)) })).unwrap();
+    let cells = Cells::open(&home, Arc::new(Racing { fake: fake.clone(), home: home.to_path_buf(), fired: Arc::new(AtomicBool::new(false)) })).unwrap();
     cells.create(&lima("adytum-p", "wall_a")).await.unwrap();
     let made = cells.create(&container("adytum-c", Some("adytum-p"), "wall_a")).await;
     assert!(matches!(&made, Err(Error::Refused(r)) if r.code == RefusalCode::ParentWall || r.code == RefusalCode::ParentMissing), "{made:?}");
     assert!(cells.get(&n("adytum-c")).is_err(), "the child was not recorded");
     assert!(fake.state(&n("adytum-c")).is_none(), "the child was not made");
     assert_eq!(cells.get(&n("adytum-p")).unwrap().spec.wall.as_str(), "wall_b");
-    std::fs::remove_dir_all(&home).unwrap();
 }

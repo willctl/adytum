@@ -18,6 +18,12 @@ impl Run {
     }
 }
 
+/// A host path as `adytum cp` hands it on: joined to the current folder,
+/// which leaves an absolute path as it is (and gives `/tmp` a drive on Windows).
+fn host(path: &str) -> String {
+    std::env::current_dir().map(|cwd| cwd.join(path).display().to_string()).unwrap_or_default()
+}
+
 struct Rig {
     driver: Arc<FakeDriver>,
     ctx: Context,
@@ -224,9 +230,9 @@ async fn cp_works_out_which_side_is_the_cell() {
     let rel = rig.go("cp ./rel.txt adytum-test-a:/tmp/rel.txt").await;
     assert_eq!(rel.code, 0);
     let calls: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("copy_")).collect();
-    assert_eq!(calls[0], "copy_in adytum-test-a /tmp/a /home/a");
-    assert_eq!(calls[1], "copy_out adytum-test-a /home/a /tmp/b");
-    assert!(calls[2].starts_with("copy_in adytum-test-a /") && calls[2].ends_with("rel.txt /tmp/rel.txt"), "{}", calls[2]);
+    assert_eq!(calls[0], format!("copy_in adytum-test-a {} /home/a", host("/tmp/a")));
+    assert_eq!(calls[1], format!("copy_out adytum-test-a /home/a {}", host("/tmp/b")));
+    assert_eq!(calls[2], format!("copy_in adytum-test-a {} /tmp/rel.txt", host("./rel.txt")));
     assert_eq!(rig.go("cp /tmp/a /tmp/b").await.code, 2);
     assert_eq!(rig.go("cp adytum-test-a:/a adytum-test-b:/b").await.code, 2);
 }
@@ -240,7 +246,7 @@ async fn cp_gives_a_copy_into_a_cell_to_the_owner_named() {
     let bad = rig.go("cp --json --owner ../root /tmp/a adytum-test-a:/opt/a").await;
     assert_eq!((bad.code, bad.json()["error"]["code"].as_str()), (1, Some("invalid")));
     let copies: Vec<String> = rig.calls().into_iter().filter(|c| c.starts_with("copy_")).collect();
-    assert_eq!(copies, ["copy_in adytum-test-a /tmp/a /opt/a (owner root)"]);
+    assert_eq!(copies, [format!("copy_in adytum-test-a {} /opt/a (owner root)", host("/tmp/a"))]);
 }
 
 #[tokio::test]

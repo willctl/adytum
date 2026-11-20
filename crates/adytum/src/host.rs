@@ -119,7 +119,10 @@ fn unsupported(what: &str) -> Error {
 impl Drivers for SystemDrivers {
     fn driver(&self, kind: KindName, host: Host) -> Result<Arc<dyn Driver>, Error> {
         match (kind, host) {
+            #[cfg(unix)]
             (KindName::Lima, Host::Machine) => Ok(Arc::new(crate::lima::Lima::system(self.lima_home.clone())?)),
+            #[cfg(not(unix))]
+            (KindName::Lima, Host::Machine) => Err(unsupported("Lima cells on this machine (they need a Mac or Linux host)")),
             (KindName::Lima, Host::Cell { .. }) => Err(unsupported("a Lima cell inside another cell")),
             #[cfg(feature = "container")]
             (KindName::Container, Host::Machine) => Ok(Arc::new(crate::container::Oci::docker())),
@@ -132,7 +135,11 @@ impl Drivers for SystemDrivers {
     }
 
     fn machine_kinds(&self) -> Vec<KindName> {
-        vec![KindName::Lima]
+        if cfg!(unix) {
+            vec![KindName::Lima]
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -167,12 +174,12 @@ mod tests {
     #[cfg(feature = "lima")]
     #[test]
     fn the_system_drivers_run_containers_in_lima_and_refuse_what_they_cannot() {
-        let drivers = SystemDrivers::new(PathBuf::from("/tmp/adytum-system-drivers"));
-        assert!(drivers.driver(KindName::Lima, Host::Machine).is_ok());
+        let drivers = SystemDrivers::new(std::env::temp_dir().join("adytum-system-drivers"));
+        assert_eq!(drivers.driver(KindName::Lima, Host::Machine).is_ok(), cfg!(unix));
         let parent = Host::Cell { name: "adytum-p".parse().unwrap(), driver: Arc::new(FakeDriver::new()) };
         assert!(matches!(drivers.driver(KindName::Lima, parent.clone()), Err(Error::Unsupported { .. })));
         assert!(matches!(drivers.driver(KindName::OpenShell, Host::Machine), Err(Error::Unsupported { .. })));
         assert_eq!(drivers.driver(KindName::Container, parent).is_ok(), cfg!(feature = "container"));
-        assert_eq!(drivers.machine_kinds(), [KindName::Lima]);
+        assert_eq!(drivers.machine_kinds().contains(&KindName::Lima), cfg!(unix));
     }
 }
