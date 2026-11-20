@@ -1,0 +1,5 @@
+# The latest stable Rust, so clippy has its newest checks. The crates still
+# build on their rust-version.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

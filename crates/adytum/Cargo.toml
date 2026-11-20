@@ -1,0 +1,37 @@
+[package]
+name = "adytum"
+description = "Sealed cells on one machine: Lima VMs behind walls, recorded in a ledger that survives a crash."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["lima"]
+lima = []
+openshell = []
+doctor = ["lima"]
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+getrandom.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The ledger's schema hash, Lima network names and the OpenShell policy pin.
+sha2.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+adytum = { path = ".", features = ["openshell", "doctor", "testing"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
