@@ -165,9 +165,7 @@ fn containers_in_a_lima_cell_from_create_to_rm() {
     println!("nest: {vm} holds {sealed} and {open}, ADYTUM_HOME {}", env.home.display());
 
     step("create the Lima cell with containers", || env.ok(&["create", &vm, "--containers", "--wall", "wall_nest"]));
-    let v = step("create a sealed container (starts the Lima cell, pulls)", || {
-        env.ok(&["create", &sealed, "--kind", "container", "--parent", &vm, "--image", ALPINE, "--sealed"])
-    });
+    let v = step("create a sealed container (starts the Lima cell, pulls)", || env.ok(&["create", &sealed, "--kind", "container", "--parent", &vm, "--image", ALPINE, "--sealed"]));
     assert_eq!((v["parent"].as_str(), v["wall"].as_str(), v["sealed"].as_bool()), (Some(vm.as_str()), Some("wall_nest"), Some(true)), "{v}");
     step("create an open container", || env.ok(&["create", &open, "--kind", "container", "--parent", &vm, "--image", ALPINE]));
     step("start both", || {
